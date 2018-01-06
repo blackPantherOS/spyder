@@ -16,6 +16,7 @@ from __future__ import print_function
 import os
 import os.path as osp
 import sys
+from collections import MutableSequence
 
 # Third party imports
 from qtpy import is_pyqt46
@@ -23,21 +24,22 @@ from qtpy.compat import getsavefilename
 from qtpy.QtCore import (QByteArray, QFileInfo, QObject, QPoint, QSize, Qt,
                          QThread, QTimer, Signal, Slot)
 from qtpy.QtGui import QFont
-from qtpy.QtWidgets import (QAction, QApplication, QHBoxLayout, QMainWindow,
-                            QMessageBox, QMenu, QSplitter, QVBoxLayout,
-                            QWidget)
+from qtpy.QtWidgets import (QAction, QApplication, QFileDialog, QHBoxLayout,
+                            QMainWindow, QMessageBox, QMenu, QSplitter,
+                            QVBoxLayout, QWidget, QListWidget, QListWidgetItem)
 
 # Local imports
-from spyder.config.base import _, DEBUG, STDERR, STDOUT
-from spyder.config.gui import config_shortcut
+from spyder.config.base import _, DEBUG, PYTEST, STDERR, STDOUT
+from spyder.config.gui import config_shortcut, get_shortcut
 from spyder.config.utils import (get_edit_filetypes, get_edit_filters,
-                                 get_filter)
+                                 get_filter, is_kde_desktop, is_anaconda)
 from spyder.py3compat import qbytearray_to_str, to_text_string
 from spyder.utils import icon_manager as ima
 from spyder.utils import (codeanalysis, encoding, sourcecode,
                           syntaxhighlighters)
 from spyder.utils.qthelpers import (add_actions, create_action,
-                                    create_toolbutton, mimedata2url)
+                                    create_toolbutton, MENU_SEPARATOR,
+                                    mimedata2url)
 from spyder.widgets.editortools import OutlineExplorerWidget
 from spyder.widgets.fileswitcher import FileSwitcher
 from spyder.widgets.findreplace import FindReplace
@@ -49,6 +51,7 @@ from spyder.widgets.status import (CursorPositionStatus, EncodingStatus,
                                    EOLStatus, ReadWriteStatus)
 from spyder.widgets.tabs import BaseTabs
 from spyder.config.main import CONF
+from spyder.widgets.explorer import show_in_external_file_explorer
 
 DEBUG_EDITOR = DEBUG >= 3
 
@@ -274,6 +277,160 @@ class FileInfo(QObject):
             self.save_breakpoints.emit(self.filename, repr(breakpoints))
 
 
+class StackHistory(MutableSequence):
+    """Handles editor stack history.
+
+    Works as a list of numbers corresponding to tab indexes.
+    Internally elements are saved using objects id's.
+    """
+
+    def __init__(self, editor):
+        self.history = list()
+        self.id_list = list()
+        self.editor = editor
+
+    def _update_id_list(self):
+        """Update list of corresponpding ids and tabs."""
+        self.id_list = [id(self.editor.tabs.widget(_i))
+                        for _i in range(self.editor.tabs.count())]
+
+    def refresh(self):
+        """Remove editors that are not longer open."""
+        self._update_id_list()
+        for _id in self.history[:]:
+            if _id not in self.id_list:
+                self.history.remove(_id)
+
+    def __len__(self):
+        return len(self.history)
+
+    def __getitem__(self, i):
+        self._update_id_list()
+        try:
+            return self.id_list.index(self.history[i])
+        except ValueError:
+            self.refresh()
+            raise IndexError
+
+    def __delitem__(self, i):
+        del self.history[i]
+
+    def __setitem__(self, i, v):
+        _id = id(self.editor.tabs.widget(v))
+        self.history[i] = _id
+
+    def __str__(self):
+        return str(list(self))
+
+    def insert(self, i, tab_index):
+        """Insert the widget (at tab index) in the position i (index)."""
+        _id = id(self.editor.tabs.widget(tab_index))
+        self.history.insert(i, _id)
+
+    def remove(self, tab_index):
+        """Remove the widget at the corresponding tab_index."""
+        _id = id(self.editor.tabs.widget(tab_index))
+        if _id in self.history:
+            self.history.remove(_id)
+
+    def remove_and_append(self, index):
+        """Remove previous entrances of a tab, and add it as the latest."""
+        while index in self:
+            self.remove(index)
+        self.append(index)
+
+
+class TabSwitcherWidget(QListWidget):
+    """Show tabs in mru order and change between them."""
+
+    def __init__(self, parent, stack_history, tabs):
+        QListWidget.__init__(self, parent)
+        self.setWindowFlags(Qt.SubWindow | Qt.FramelessWindowHint | Qt.Dialog)
+
+        self.editor = parent
+        self.stack_history = stack_history
+        self.tabs = tabs
+
+        self.setSelectionMode(QListWidget.SingleSelection)
+        self.itemActivated.connect(self.item_selected)
+
+        self.id_list = []
+        self.load_data()
+        size = CONF.get('main', 'completion/size')
+        self.resize(*size)
+        self.set_dialog_position()
+        self.setCurrentRow(0)
+
+        config_shortcut(lambda: self.select_row(-1), context='Editor',
+                        name='Go to previous file', parent=self)
+        config_shortcut(lambda: self.select_row(1), context='Editor',
+                        name='Go to next file', parent=self)
+
+    def load_data(self):
+        """Fill ListWidget with the tabs texts.
+
+        Add elements in inverse order of stack_history.
+        """
+        for index in reversed(self.stack_history):
+            text = self.tabs.tabText(index)
+            text = text.replace('&', '')
+            item = QListWidgetItem(ima.icon('TextFileIcon'), text)
+            self.addItem(item)
+
+    def item_selected(self, item=None):
+        """Change to the selected document and hide this widget."""
+        if item is None:
+            item = self.currentItem()
+
+        # stack history is in inverse order
+        try:
+            index = self.stack_history[-(self.currentRow()+1)]
+        except IndexError:
+            pass
+        else:
+            self.editor.set_stack_index(index)
+            self.editor.current_changed(index)
+        self.hide()
+
+    def select_row(self, steps):
+        """Move selected row a number of steps.
+
+        Iterates in a cyclic behaviour.
+        """
+        row = (self.currentRow() + steps) % self.count()
+        self.setCurrentRow(row)
+
+    def set_dialog_position(self):
+        """Positions the tab switcher in the top-center of the editor."""
+        left = self.editor.geometry().width()/2 - self.width()/2
+        top = self.editor.tabs.tabBar().geometry().height()
+
+        self.move(self.editor.mapToGlobal(QPoint(left, top)))
+
+    def keyReleaseEvent(self, event):
+        """Reimplement Qt method.
+
+        Handle "most recent used" tab behavior,
+        When ctrl is released and tab_switcher is visible, tab will be changed.
+        """
+        if self.isVisible():
+            qsc = get_shortcut(context='Editor', name='Go to next file')
+
+            for key in qsc.split('+'):
+                key = key.lower()
+                if ((key == 'ctrl' and event.key() == Qt.Key_Control) or
+                   (key == 'alt' and event.key() == Qt.Key_Alt)):
+                        self.item_selected()
+        event.accept()
+
+    def keyPressEvent(self, event):
+        """Reimplement Qt method to allow cyclic behavior."""
+        if event.key() == Qt.Key_Down:
+            self.select_row(1)
+        elif event.key() == Qt.Key_Up:
+            self.select_row(-1)
+
+
 class EditorStack(QWidget):
     reset_statusbar = Signal()
     readonly_changed = Signal(bool)
@@ -289,10 +446,10 @@ class EditorStack(QWidget):
     zoom_in = Signal()
     zoom_out = Signal()
     zoom_reset = Signal()
-    sig_close_file = Signal(str, int)
-    file_saved = Signal(str, int, str)
-    file_renamed_in_data = Signal(str, int, str)
-    create_new_window = Signal()
+    sig_close_file = Signal(str, str)
+    file_saved = Signal(str, str, str)
+    file_renamed_in_data = Signal(str, str, str)
+    sig_undock_window = Signal()
     opened_files_list_changed = Signal()
     analysis_results_changed = Signal()
     todo_results_changed = Signal()
@@ -304,13 +461,16 @@ class EditorStack(QWidget):
     current_file_changed = Signal(str ,int)
     plugin_load = Signal((str,), ())
     edit_goto = Signal(str, int, str)
-    split_vertically = Signal()
-    split_horizontally = Signal()
+    sig_split_vertically = Signal()
+    sig_split_horizontally = Signal()
+    sig_close_split = Signal()
     sig_new_file = Signal((str,), ())
     sig_save_as = Signal()
     sig_prev_edit_pos = Signal()
     sig_prev_cursor = Signal()
     sig_next_cursor = Signal()
+    sig_prev_warning = Signal()
+    sig_next_warning = Signal()
 
     def __init__(self, parent, actions):
         QWidget.__init__(self, parent)
@@ -318,8 +478,8 @@ class EditorStack(QWidget):
         self.setAttribute(Qt.WA_DeleteOnClose)
 
         self.threadmanager = ThreadManager(self)
-
-        self.newwindow_action = None
+        self.new_window = False
+        self.undock_action = None
         self.horsplit_action = None
         self.versplit_action = None
         self.close_action = None
@@ -335,8 +495,9 @@ class EditorStack(QWidget):
 #        self.previous_btn = None
 #        self.next_btn = None
         self.tabs = None
+        self.tabs_switcher = None
 
-        self.stack_history = []
+        self.stack_history = StackHistory(self)
 
         self.setup_editorstack(parent, layout)
 
@@ -358,8 +519,16 @@ class EditorStack(QWidget):
                                     triggered=self.close_all_right)
         close_all_but_this = create_action(self, _("Close all but this"),
                                            triggered=self.close_all_but_this)
+        
+        if sys.platform == 'darwin':
+           text=_("Show in Finder")
+        else:
+           text= _("Show in external file explorer")
+        external_fileexp_action = create_action(self, text,
+                                triggered=self.show_in_external_file_explorer)
 
-        self.menu_actions = actions + [None, fileswitcher_action,
+        self.menu_actions = actions + [external_fileexp_action,
+                                       None, fileswitcher_action,
                                        symbolfinder_action,
                                        copy_to_cb_action, None, close_right,
                                        close_all_but_this]
@@ -380,6 +549,7 @@ class EditorStack(QWidget):
         self.is_analysis_done = False
         self.linenumbers_enabled = True
         self.blanks_enabled = False
+        self.scrollpastend_enabled = False
         self.edgeline_enabled = True
         self.edgeline_columns = (79,)
         self.codecompletion_auto_enabled = True
@@ -393,6 +563,7 @@ class EditorStack(QWidget):
         self.auto_unindent_enabled = True
         self.indent_chars = " "*4
         self.tab_stop_width_spaces = 4
+        self.show_class_func_dropdown = False
         self.help_enabled = False
         self.default_font = None
         self.wrap_enabled = False
@@ -404,10 +575,13 @@ class EditorStack(QWidget):
         self.occurrence_highlighting_timeout=1500
         self.checkeolchars_enabled = True
         self.always_remove_trailing_spaces = False
+        self.convert_eol_on_save = False
+        self.convert_eol_on_save_to = 'LF'
         self.fullpath_sorting_enabled = None
         self.focus_to_editor = True
         self.set_fullpath_sorting_enabled(False)
         self.create_new_file_if_empty = True
+        self.indent_guides = False
         ccs = 'Spyder'
         if ccs not in syntaxhighlighters.COLOR_SCHEME_NAMES:
             ccs = syntaxhighlighters.COLOR_SCHEME_NAMES[0]
@@ -430,6 +604,23 @@ class EditorStack(QWidget):
         #For opening last closed tabs
         self.last_closed_files = []
 
+        # Reference to save msgbox and avoid memory to be freed.
+        self.msgbox = None
+
+        # File types and filters used by the Save As dialog
+        self.edit_filetypes = None
+        self.edit_filters = None
+
+        # For testing
+        self.save_dialog_on_tests = not PYTEST
+
+    @Slot()
+    def show_in_external_file_explorer(self, fnames=None):
+        """Show file in external file explorer"""
+        if fnames is None:
+            fnames = self.get_current_filename()
+        show_in_external_file_explorer(fnames)
+
     def create_shortcuts(self):
         """Create local shortcuts"""
         # --- Configurable shortcuts
@@ -445,10 +636,17 @@ class EditorStack(QWidget):
                                     parent=self)
         gotoline = config_shortcut(self.go_to_line, context='Editor',
                                    name='Go to line', parent=self)
-        tab = config_shortcut(self.go_to_previous_file, context='Editor',
+        tab = config_shortcut(lambda: self.tab_navigation_mru(forward=False),
+                              context='Editor',
                               name='Go to previous file', parent=self)
-        tabshift = config_shortcut(self.go_to_next_file, context='Editor',
+        tabshift = config_shortcut(self.tab_navigation_mru, context='Editor',
                                    name='Go to next file', parent=self)
+        prevtab = config_shortcut(lambda: self.tabs.tab_navigate(-1),
+                                  context='Editor',
+                                  name='Cycle to previous file', parent=self)
+        nexttab = config_shortcut(lambda: self.tabs.tab_navigate(1),
+                                  context='Editor',
+                                  name='Cycle to next file', parent=self)
         run_selection = config_shortcut(self.run_selection, context='Editor',
                                         name='Run selection', parent=self)
         new_file = config_shortcut(lambda : self.sig_new_file[()].emit(),
@@ -510,9 +708,37 @@ class EditorStack(QWidget):
                                       context="Editor",
                                       name="run cell and advance",
                                       parent=self)
+        go_to_next_cell = config_shortcut(self.advance_cell,
+                                          context="Editor",
+                                          name="go to next cell",
+                                          parent=self)
+        go_to_previous_cell = config_shortcut(lambda: self.advance_cell(reverse=True),
+                                              context="Editor",
+                                              name="go to previous cell",
+                                              parent=self)
         re_run_last_cell = config_shortcut(self.re_run_last_cell,
                                       context="Editor",
                                       name="re-run last cell",
+                                      parent=self)
+        prev_warning = config_shortcut(lambda: self.sig_prev_warning.emit(),
+                                       context="Editor",
+                                       name="Previous warning",
+                                       parent=self)
+        next_warning = config_shortcut(lambda: self.sig_next_warning.emit(),
+                                       context="Editor",
+                                       name="Next warning",
+                                       parent=self)
+        split_vertically = config_shortcut(lambda: self.sig_split_vertically.emit(),
+                                           context="Editor",
+                                           name="split vertically",
+                                           parent=self)
+        split_horizontally = config_shortcut(lambda: self.sig_split_horizontally.emit(),
+                                             context="Editor",
+                                             name="split horizontally",
+                                             parent=self)
+        close_split = config_shortcut(lambda: self.sig_close_split.emit(),
+                                      context="Editor",
+                                      name="close split panel",
                                       parent=self)
 
         # Return configurable ones
@@ -521,7 +747,9 @@ class EditorStack(QWidget):
                 save_all, save_as, close_all, prev_edit_pos, prev_cursor,
                 next_cursor, zoom_in_1, zoom_in_2, zoom_out, zoom_reset,
                 close_file_1, close_file_2, run_cell, run_cell_and_advance,
-                re_run_last_cell]
+                go_to_next_cell, go_to_previous_cell, re_run_last_cell,
+                prev_warning, next_warning, split_vertically,
+                split_horizontally, close_split, prevtab, nexttab]
 
     def get_shortcut_data(self):
         """
@@ -565,7 +793,10 @@ class EditorStack(QWidget):
                              corner_widgets=corner_widgets)
         self.tabs.tabBar().setObjectName('plugin-tab')
         self.tabs.set_close_function(self.close_file)
+        self.tabs.tabBar().tabMoved.connect(self.move_editorstack_data)
         self.tabs.setMovable(True)
+
+        self.stack_history.refresh()
 
         if hasattr(self.tabs, 'setDocumentMode') \
            and not sys.platform == 'darwin':
@@ -573,7 +804,7 @@ class EditorStack(QWidget):
             # a crash when the editor is detached from the main window
             # Fixes Issue 561
             self.tabs.setDocumentMode(True)
-        self.tabs.currentChanged.connect(self.current_changed_tabs)
+        self.tabs.currentChanged.connect(self.current_changed)
 
         if sys.platform == 'darwin':
             tab_container = QWidget()
@@ -591,6 +822,12 @@ class EditorStack(QWidget):
     def closeEvent(self, event):
         self.threadmanager.close_all_threads()
         self.analysis_timer.timeout.disconnect(self.analyze_script)
+
+        # Remove editor references from the outline explorer settings
+        if self.outlineexplorer is not None:
+            for finfo in self.data:
+                self.outlineexplorer.remove_editor(finfo.editor)
+
         QWidget.closeEvent(self, event)
         if is_pyqt46:
             self.destroyed.emit()
@@ -622,9 +859,9 @@ class EditorStack(QWidget):
             self.fileswitcher_dlg.hide()
             self.fileswitcher_dlg.is_visible = False
             return
-        self.fileswitcher_dlg = FileSwitcher(self, self.tabs, self.data)
+        self.fileswitcher_dlg = FileSwitcher(self, self, self.tabs, self.data,
+                                             ima.icon('TextFileIcon'))
         self.fileswitcher_dlg.sig_goto_file.connect(self.set_stack_index)
-        self.fileswitcher_dlg.sig_close_file.connect(self.close_file)
         self.fileswitcher_dlg.show()
         self.fileswitcher_dlg.is_visible = True
 
@@ -633,15 +870,19 @@ class EditorStack(QWidget):
         self.open_fileswitcher_dlg()
         self.fileswitcher_dlg.set_search_text('@')
         
-    def update_fileswitcher_dlg(self):
-        """Synchronize file list dialog box with editor widget tabs"""
-        if self.fileswitcher_dlg:
-            self.fileswitcher_dlg.setup()
+    def get_current_tab_manager(self):
+        """Get the widget with the TabWidget attribute."""
+        return self
 
-    def go_to_line(self):
+    def go_to_line(self, line=None):
         """Go to line dialog"""
-        if self.data:
-            self.get_current_editor().exec_gotolinedialog()
+        if line is not None:
+            # When this method is called from the flileswitcher, a line
+            # number is specified, so there is no need for the dialog.
+            self.get_current_editor().go_to_line(line)
+        else:
+            if self.data:
+                self.get_current_editor().exec_gotolinedialog()
 
     def set_or_clear_breakpoint(self):
         """Set/clear breakpoint"""
@@ -707,6 +948,13 @@ class EditorStack(QWidget):
     def set_title(self, text):
         self.title = text
 
+    def set_classfunc_dropdown_visible(self, state):
+        self.show_class_func_dropdown = state
+        if self.data:
+            for finfo in self.data:
+                if finfo.editor.is_python_like():
+                    finfo.editor.classfuncdropdown.setVisible(state)
+
     def __update_editor_margins(self, editor):
         editor.linenumberarea.setup_margins(linenumbers=self.linenumbers_enabled,
                              markers=self.has_markers())
@@ -767,6 +1015,12 @@ class EditorStack(QWidget):
             for finfo in self.data:
                 finfo.editor.set_blanks_enabled(state)
 
+    def set_scrollpastend_enabled(self, state):
+        self.scrollpastend_enabled = state
+        if self.data:
+            for finfo in self.data:
+                finfo.editor.set_scrollpastend_enabled(state)
+
     def set_edgeline_enabled(self, state):
         # CONF.get(self.CONF_SECTION, 'edge_line')
         self.edgeline_enabled = state
@@ -780,6 +1034,12 @@ class EditorStack(QWidget):
         if self.data:
             for finfo in self.data:
                 finfo.editor.edge_line.set_columns(columns)
+
+    def set_indent_guides(self, state):
+        self.indent_guides = state
+        if self.data:
+            for finfo in self.data:
+                finfo.editor.indent_guides.set_enabled(state)
 
     def set_codecompletion_auto_enabled(self, state):
         # CONF.get(self.CONF_SECTION, 'codecompletion_auto')
@@ -939,6 +1199,16 @@ class EditorStack(QWidget):
         # CONF.get(self.CONF_SECTION, 'always_remove_trailing_spaces')
         self.always_remove_trailing_spaces = state
 
+    def set_convert_eol_on_save(self, state):
+        """If `state` is `True`, saving files will convert line endings."""
+        # CONF.get(self.CONF_SECTION, 'convert_eol_on_save')
+        self.convert_eol_on_save = state
+
+    def set_convert_eol_on_save_to(self, state):
+        """`state` can be one of ('LF', 'CRLF', 'CR')"""
+        # CONF.get(self.CONF_SECTION, 'convert_eol_on_save_to')
+        self.convert_eol_on_save_to = state
+
     def set_focus_to_editor(self, state):
         self.focus_to_editor = state
 
@@ -959,8 +1229,9 @@ class EditorStack(QWidget):
     def get_stack_count(self):
         return self.tabs.count()
 
-    def set_stack_index(self, index):
-        self.tabs.setCurrentIndex(index)
+    def set_stack_index(self, index, instance=None):
+        if instance == self or instance == None:
+            self.tabs.setCurrentIndex(index)
 
     def set_tabbar_visible(self, state):
         self.tabs.tabBar().setVisible(state)
@@ -971,7 +1242,6 @@ class EditorStack(QWidget):
         self.data.pop(index)
         self.tabs.blockSignals(False)
         self.update_actions()
-        self.update_fileswitcher_dlg()
 
     def __modified_readonly_title(self, title, is_modified, is_readonly):
         if is_modified is not None and is_modified:
@@ -984,7 +1254,7 @@ class EditorStack(QWidget):
         """Return tab title."""
         files_path_list = [finfo.filename for finfo in self.data]
         fname = self.data[index].filename
-        fname = sourcecode.get_file_title(files_path_list, fname)
+        fname = sourcecode.disambiguate_fname(files_path_list, fname)
         return self.__modified_readonly_title(fname,
                                               is_modified, is_readonly)
 
@@ -1019,7 +1289,6 @@ class EditorStack(QWidget):
             self.set_stack_index(index)
             self.current_changed(index)
         self.update_actions()
-        self.update_fileswitcher_dlg()
 
     def __repopulate_stack(self):
         self.tabs.blockSignals(True)
@@ -1035,9 +1304,11 @@ class EditorStack(QWidget):
             index = self.tabs.addTab(finfo.editor, tab_text)
             self.tabs.setTabToolTip(index, tab_tip)
         self.tabs.blockSignals(False)
-        self.update_fileswitcher_dlg()
 
-    def rename_in_data(self, index, new_filename):
+    def rename_in_data(self, original_filename, new_filename):
+        index = self.has_filename(original_filename)
+        if index is None:
+            return
         finfo = self.data[index]
         if osp.splitext(finfo.filename)[1] != osp.splitext(new_filename)[1]:
             # File type has changed!
@@ -1065,7 +1336,11 @@ class EditorStack(QWidget):
         is_readonly = finfo.editor.isReadOnly()
         tab_text = self.get_tab_text(index, is_modified, is_readonly)
         tab_tip = self.get_tab_tip(fname, is_modified, is_readonly)
-        self.tabs.setTabText(index, tab_text)
+
+        # Only update tab text if have changed, otherwise an unwanted scrolling
+        # will happen when changing tabs. See Issue #1170.
+        if tab_text != self.tabs.tabText(index):
+            self.tabs.setTabText(index, tab_text)
         self.tabs.setTabToolTip(index, tab_tip)
 
 
@@ -1078,29 +1353,43 @@ class EditorStack(QWidget):
         else:
             actions = (self.new_action, self.open_action)
             self.setFocus() # --> Editor.__get_focus_editortabwidget
-        add_actions(self.menu, list(actions)+self.__get_split_actions())
+        add_actions(self.menu, list(actions) + self.__get_split_actions())
         self.close_action.setEnabled(self.is_closable)
 
 
     #------ Hor/Ver splitting
     def __get_split_actions(self):
-        # New window
-        self.newwindow_action = create_action(self, _("New window"),
-                icon=ima.icon('newwindow'), tip=_("Create a new editor window"),
-                triggered=lambda: self.create_new_window.emit())
+        # Undock Editor window
+        self.undock_action = create_action(self, _("Undock Editor window"),
+                                           icon=ima.icon('newwindow'),
+                                           tip=_("Undock the editor window"),
+                                           triggered=lambda:
+                                               self.sig_undock_window.emit())
         # Splitting
         self.versplit_action = create_action(self, _("Split vertically"),
                 icon=ima.icon('versplit'),
                 tip=_("Split vertically this editor window"),
-                triggered=lambda: self.split_vertically.emit())
+                triggered=lambda: self.sig_split_vertically.emit(),
+                shortcut=get_shortcut(context='Editor', name='split vertically'),
+                context=Qt.WidgetShortcut)
         self.horsplit_action = create_action(self, _("Split horizontally"),
                 icon=ima.icon('horsplit'),
                 tip=_("Split horizontally this editor window"),
-                triggered=lambda: self.split_horizontally.emit())
+                triggered=lambda: self.sig_split_horizontally.emit(),
+                shortcut=get_shortcut(context='Editor', name='split horizontally'),
+                context=Qt.WidgetShortcut)
         self.close_action = create_action(self, _("Close this panel"),
-                icon=ima.icon('close_panel'), triggered=self.close)
-        return [None, self.newwindow_action, None,
-                self.versplit_action, self.horsplit_action, self.close_action]
+                icon=ima.icon('close_panel'),
+                triggered=lambda: self.sig_close_split.emit(),
+                shortcut=get_shortcut(context='Editor', name='close split panel'),
+                context=Qt.WidgetShortcut)
+        actions = [MENU_SEPARATOR, self.undock_action,
+                   MENU_SEPARATOR, self.versplit_action,
+                   self.horsplit_action, self.close_action]
+        if self.new_window:
+            actions = [MENU_SEPARATOR, self.versplit_action,
+                       self.horsplit_action, self.close_action]
+        return actions
 
     def reset_orientation(self):
         self.horsplit_action.setEnabled(True)
@@ -1115,17 +1404,26 @@ class EditorStack(QWidget):
         self.horsplit_action.setEnabled(state)
         self.versplit_action.setEnabled(state)
 
-
-    #------ Accessors
+    # ------ Accessors
     def get_current_filename(self):
         if self.data:
             return self.data[self.get_stack_index()].filename
 
     def has_filename(self, filename):
+        """Return the self.data index position for the filename.
+
+        Args:
+            filename: Name of the file to search for in self.data.
+
+        Returns:
+            The self.data index for the filename.  Returns None
+            if the filename is not found in self.data.
+        """
         fixpath = lambda path: osp.normcase(osp.realpath(path))
         for index, finfo in enumerate(self.data):
             if fixpath(filename) == fixpath(finfo.filename):
                 return index
+        return None
 
     def set_current_filename(self, filename, focus=True):
         """Set current filename and return the associated editor instance."""
@@ -1136,14 +1434,56 @@ class EditorStack(QWidget):
             editor = self.data[index].editor
             if focus:
                 editor.setFocus()
-            return editor
+            else:
+                self.stack_history.remove_and_append(index)
+
+            return editor  
 
     def is_file_opened(self, filename=None):
+        """Return if filename is in the editor stack.
+
+        Args:
+            filename: Name of the file to search for.  If filename is None,
+                then checks if any file is open.
+
+        Returns:
+            True: If filename is None and a file is open.
+            False: If filename is None and no files are open.
+            None: If filename is not None and the file isn't found.
+            integer: Index of file name in editor stack.
+        """
         if filename is None:
             # Is there any file opened?
             return len(self.data) > 0
         else:
             return self.has_filename(filename)
+
+    def get_index_from_filename(self, filename):
+        """
+        Return the position index of a file in the tab bar of the editorstack
+        from its name.
+        """
+        filenames = [d.filename for d in self.data]
+        return filenames.index(filename)
+
+    @Slot(int, int)
+    def move_editorstack_data(self, start, end):
+        """Reorder editorstack.data so it is synchronized with the tab bar when
+        tabs are moved."""
+        if start < 0 or end < 0:
+            return
+        else:
+            steps = abs(end - start)
+            direction = (end-start) // steps  # +1 for right, -1 for left
+
+        data = self.data
+        self.blockSignals(True)
+
+        for i in range(start, end, direction):
+            data[i], data[i+direction] = data[i+direction], data[i]
+
+        self.blockSignals(False)
+        self.refresh()
 
 
     #------ Close file, tabwidget...
@@ -1176,13 +1516,14 @@ class EditorStack(QWidget):
             if self.outlineexplorer is not None:
                 self.outlineexplorer.remove_editor(finfo.editor)
 
+            filename = self.data[index].filename
             self.remove_from_data(index)
 
             # We pass self object ID as a QString, because otherwise it would
             # depend on the platform: long for 64bit, int for 32bit. Replacing
             # by long all the time is not working on some 32bit platforms
             # (see Issue 1094, Issue 1098)
-            self.sig_close_file.emit(str(id(self)), index)
+            self.sig_close_file.emit(str(id(self)), filename)
 
             if not self.data and self.is_closable:
                 # editortabwidget is empty: removing it
@@ -1246,7 +1587,21 @@ class EditorStack(QWidget):
 
     #------ Save
     def save_if_changed(self, cancelable=False, index=None):
-        """Ask user to save file if modified"""
+        """Ask user to save file if modified.
+
+        Args:
+            cancelable: Show Cancel button.
+            index: File to check for modification.
+
+        Returns:
+            False when save() fails or is cancelled.
+            True when save() is successful, there are no modifications,
+                or user selects No or NoToAll.
+
+        This function controls the message box prompt for saving
+        changed files.  The actual save is performed in save() for
+        each index processed.
+        """
         if index is None:
             indexes = list(range(self.get_stack_count()))
         else:
@@ -1262,35 +1617,57 @@ class EditorStack(QWidget):
             # No file to save
             return True
         if unsaved_nb > 1:
-            buttons |= QMessageBox.YesAll | QMessageBox.NoAll
+            buttons |= QMessageBox.YesToAll | QMessageBox.NoToAll
         yes_all = False
         for index in indexes:
             self.set_stack_index(index)
             finfo = self.data[index]
             if finfo.filename == self.tempfile_path or yes_all:
-                if not self.save():
+                if not self.save(index):
                     return False
-            elif finfo.editor.document().isModified():
-                answer = QMessageBox.question(self, self.title,
-                            _("<b>%s</b> has been modified."
-                              "<br>Do you want to save changes?"
-                              ) % osp.basename(finfo.filename),
-                            buttons)
+            elif (finfo.editor.document().isModified() and
+                  self.save_dialog_on_tests):
+
+                self.msgbox = QMessageBox(
+                        QMessageBox.Question,
+                        self.title,
+                        _("<b>%s</b> has been modified."
+                          "<br>Do you want to save changes?"
+                         ) % osp.basename(finfo.filename),
+                          buttons,
+                          parent=self)
+
+                answer = self.msgbox.exec_()
                 if answer == QMessageBox.Yes:
-                    if not self.save():
+                    if not self.save(index):
                         return False
-                elif answer == QMessageBox.YesAll:
-                    if not self.save():
+                elif answer == QMessageBox.YesToAll:
+                    if not self.save(index):
                         return False
                     yes_all = True
-                elif answer == QMessageBox.NoAll:
+                elif answer == QMessageBox.NoToAll:
                     return True
                 elif answer == QMessageBox.Cancel:
                     return False
         return True
 
     def save(self, index=None, force=False):
-        """Save file"""
+        """Write text of editor to a file.
+
+        Args:
+            index: self.data index to save.  If None, defaults to
+                currentIndex().
+            force: Force save regardless of file state.
+
+        Returns:
+            True upon successful save or when file doesn't need to be saved.
+            False if save failed.
+
+        If the text isn't modified and it's not newly created, then the save
+        is aborted.  If the file hasn't been saved before, then save_as()
+        is invoked.  Otherwise, the file is written using the file name
+        currently in self.data.  This function doesn't change the file name.
+        """
         if index is None:
             # Save the currently edited file
             if not self.get_stack_count():
@@ -1306,6 +1683,12 @@ class EditorStack(QWidget):
             return self.save_as(index=index)
         if self.always_remove_trailing_spaces:
             self.remove_trailing_spaces(index)
+        if self.convert_eol_on_save:
+            # hack to account for the fact that the config file saves
+            # CR/LF/CRLF while set_os_eol_chars wants the os.name value.
+            osname_lookup = {'LF': 'posix', 'CRLF': 'nt', 'CR': 'mac'}
+            osname = osname_lookup[self.convert_eol_on_save_to]
+            self.set_os_eol_chars(osname=osname)
         txt = to_text_string(finfo.editor.get_text_with_eol())
         try:
             finfo.encoding = encoding.write(txt, finfo.filename,
@@ -1318,7 +1701,10 @@ class EditorStack(QWidget):
             # depend on the platform: long for 64bit, int for 32bit. Replacing
             # by long all the time is not working on some 32bit platforms
             # (see Issue 1094, Issue 1098)
-            self.file_saved.emit(str(id(self)), index, finfo.filename)
+            # The filename is passed instead of an index in case the tabs
+            # have been rearranged (see issue 5703).
+            self.file_saved.emit(str(id(self)),
+                                 finfo.filename, finfo.filename)
 
             finfo.editor.document().setModified(False)
             self.modification_changed(index=index)
@@ -1335,38 +1721,93 @@ class EditorStack(QWidget):
             self._refresh_outlineexplorer(index)
             return True
         except EnvironmentError as error:
-            QMessageBox.critical(self, _("Save"),
-                                 _("<b>Unable to save script '%s'</b>"
-                                   "<br><br>Error message:<br>%s"
-                                   ) % (osp.basename(finfo.filename),
-                                        str(error)))
+            self.msgbox = QMessageBox(
+                    QMessageBox.Critical,
+                    _("Save"),
+                    _("<b>Unable to save file '%s'</b>"
+                      "<br><br>Error message:<br>%s"
+                      ) % (osp.basename(finfo.filename),
+                                        str(error)),
+                    parent=self)
+            self.msgbox.exec_()
             return False
 
-    def file_saved_in_other_editorstack(self, index, filename):
+    def file_saved_in_other_editorstack(self, original_filename, filename):
         """
         File was just saved in another editorstack, let's synchronize!
-        This avoid file to be automatically reloaded
+        This avoids file being automatically reloaded.
 
-        Filename is passed in case file was just saved as another name
+        The original filename is passed instead of an index in case the tabs
+        on the editor stacks were moved and are now in a different order - see
+        issue 5703.
+        Filename is passed in case file was just saved as another name.
         """
+        index = self.has_filename(original_filename)
+        if index is None:
+            return
         finfo = self.data[index]
         finfo.newly_created = False
         finfo.filename = to_text_string(filename)
         finfo.lastmodified = QFileInfo(finfo.filename).lastModified()
 
     def select_savename(self, original_filename):
+        """Select a name to save a file.
+
+        Args:
+            original_filename: Used in the dialog to display the current file
+                    path and name.
+
+        Returns:
+            Normalized path for the selected file name or None if no name was
+            selected.
+        """
+        if self.edit_filetypes is None:
+            self.edit_filetypes = get_edit_filetypes()
+        if self.edit_filters is None:
+            self.edit_filters = get_edit_filters()
+
+        # Don't use filters on KDE to not make the dialog incredible
+        # slow
+        # Fixes issue 4156
+        if is_kde_desktop() and not is_anaconda():
+            filters = ''
+            selectedfilter = ''
+        else:
+            filters = self.edit_filters
+            selectedfilter = get_filter(self.edit_filetypes,
+                                        osp.splitext(original_filename)[1])
+
         self.redirect_stdio.emit(False)
         filename, _selfilter = getsavefilename(self, _("Save file"),
-                                       original_filename,
-                                       get_edit_filters(),
-                                       get_filter(get_edit_filetypes(),
-                                           osp.splitext(original_filename)[1]))
+                                    original_filename,
+                                    filters=filters,
+                                    selectedfilter=selectedfilter,
+                                    options=QFileDialog.HideNameFilterDetails)
         self.redirect_stdio.emit(True)
         if filename:
             return osp.normpath(filename)
+        return None
 
     def save_as(self, index=None):
-        """Save file as..."""
+        """Save file as...
+
+        Args:
+            index: self.data index for the file to save.
+
+        Returns:
+            False if no file name was selected or if save() was unsuccessful.
+            True is save() was successful.
+
+        Gets the new file name from select_savename().  If no name is chosen,
+        then the save_as() aborts.  Otherwise, the current stack is checked
+        to see if the selected name already exists and, if so, then the tab
+        with that name is closed.
+
+        The current stack (self.data) and current tabs are updated with the
+        new name and other file info.  The text is written with the new
+        name using save() and the name change is propagated to the other stacks
+        via the file_renamed_in_data signal.
+        """
         if index is None:
             # Save the currently edited file
             index = self.get_stack_index()
@@ -1375,23 +1816,26 @@ class EditorStack(QWidget):
         # While running __check_file_status
         # See issues 3678 and 3026
         finfo.newly_created = True
-        filename = self.select_savename(finfo.filename)
+        original_filename = finfo.filename
+        filename = self.select_savename(original_filename)
         if filename:
             ao_index = self.has_filename(filename)
             # Note: ao_index == index --> saving an untitled file
-            if ao_index and ao_index != index:
+            if ao_index is not None and ao_index != index:
                 if not self.close_file(ao_index):
                     return
                 if ao_index < index:
                     index -= 1
 
-            new_index = self.rename_in_data(index, new_filename=filename)
+            new_index = self.rename_in_data(original_filename,
+                                            new_filename=filename)
 
             # We pass self object ID as a QString, because otherwise it would
             # depend on the platform: long for 64bit, int for 32bit. Replacing
             # by long all the time is not working on some 32bit platforms
             # (see Issue 1094, Issue 1098)
-            self.file_renamed_in_data.emit(str(id(self)), index, filename)
+            self.file_renamed_in_data.emit(str(id(self)),
+                                           original_filename, filename)
 
             ok = self.save(index=new_index, force=True)
             self.refresh(new_index)
@@ -1400,12 +1844,65 @@ class EditorStack(QWidget):
         else:
             return False
 
+    def save_copy_as(self, index=None):
+        """Save copy of file as...
+
+        Args:
+            index: self.data index for the file to save.
+
+        Returns:
+            False if no file name was selected or if save() was unsuccessful.
+            True is save() was successful.
+
+        Gets the new file name from select_savename().  If no name is chosen,
+        then the save_copy_as() aborts.  Otherwise, the current stack is
+        checked to see if the selected name already exists and, if so, then the
+        tab with that name is closed.
+
+        Unlike save_as(), this calls write() directly instead of using save().
+        The current file and tab aren't changed at all.  The copied file is
+        opened in a new tab.
+        """
+        if index is None:
+            # Save the currently edited file
+            index = self.get_stack_index()
+        finfo = self.data[index]
+        original_filename = finfo.filename
+        filename = self.select_savename(original_filename)
+        if filename:
+            ao_index = self.has_filename(filename)
+            # Note: ao_index == index --> saving an untitled file
+            if ao_index is not None and ao_index != index:
+                if not self.close_file(ao_index):
+                    return
+                if ao_index < index:
+                    index -= 1
+            txt = to_text_string(finfo.editor.get_text_with_eol())
+            try:
+                finfo.encoding = encoding.write(txt, filename, finfo.encoding)
+                # open created copy file
+                self.plugin_load.emit(filename)
+                return True
+            except EnvironmentError as error:
+                self.msgbox = QMessageBox(
+                    QMessageBox.Critical,
+                    _("Save"),
+                    _("<b>Unable to save file '%s'</b>"
+                      "<br><br>Error message:<br>%s"
+                      ) % (osp.basename(finfo.filename),
+                                        str(error)),
+                    parent=self)
+                self.msgbox.exec_()
+        else:
+            return False
+
     def save_all(self):
-        """Save all opened files"""
-        folders = set()
+        """Save all opened files.
+
+        Iterate through self.data and call save() on any modified files.
+        """
         for index in range(self.get_stack_count()):
             if self.data[index].editor.document().isModified():
-                folders.add(osp.dirname(self.data[index].filename))
                 self.save(index)
 
     #------ Update UI
@@ -1430,33 +1927,36 @@ class EditorStack(QWidget):
                 finfo.run_todo_finder()
         self.is_analysis_done = True
 
-    def set_analysis_results(self, index, analysis_results):
+    def set_analysis_results(self, filename, analysis_results):
         """Synchronize analysis results between editorstacks"""
+        index = self.has_filename(filename)
+        if index is None:
+            return
         self.data[index].set_analysis_results(analysis_results)
 
     def get_analysis_results(self):
         if self.data:
             return self.data[self.get_stack_index()].analysis_results
 
-    def set_todo_results(self, index, todo_results):
+    def set_todo_results(self, filename, todo_results):
         """Synchronize todo results between editorstacks"""
+        index = self.has_filename(filename)
+        if index is None:
+            return
         self.data[index].set_todo_results(todo_results)
 
     def get_todo_results(self):
         if self.data:
             return self.data[self.get_stack_index()].todo_results
 
-    def  current_changed_tabs(self, index):
-        self.current_changed(index, set_focus=False)
-
-    def current_changed(self, index, set_focus=True):
+    def current_changed(self, index):
         """Stack index has changed"""
 #        count = self.get_stack_count()
 #        for btn in (self.filelist_btn, self.previous_btn, self.next_btn):
 #            btn.setEnabled(count > 1)
 
         editor = self.get_current_editor()
-        if index != -1 and set_focus:
+        if index != -1:
             editor.setFocus()
             if DEBUG_EDITOR:
                 print("setfocusto:", editor, file=STDOUT)
@@ -1464,56 +1964,46 @@ class EditorStack(QWidget):
             self.reset_statusbar.emit()
         self.opened_files_list_changed.emit()
 
-        # Index history management
-        id_list = [id(self.tabs.widget(_i))
-                   for _i in range(self.tabs.count())]
-        for _id in self.stack_history[:]:
-            if _id not in id_list:
-                self.stack_history.pop(self.stack_history.index(_id))
-        current_id = id(self.tabs.widget(index))
-        while current_id in self.stack_history:
-            self.stack_history.pop(self.stack_history.index(current_id))
-        self.stack_history.append(current_id)
+        self.stack_history.refresh()
+        self.stack_history.remove_and_append(index)
+
         if DEBUG_EDITOR:
             print("current_changed:", index, self.data[index].editor, end=' ', file=STDOUT)
             print(self.data[index].editor.get_document_id(), file=STDOUT)
 
         self.update_plugin_title.emit()
         if editor is not None:
-            self.current_file_changed.emit(self.data[index].filename,
+            # Needed in order to handle the close of files open in a directory
+            # that has been renamed. See issue 5157
+            try:
+                self.current_file_changed.emit(self.data[index].filename,
                                            editor.get_position('cursor'))
+            except IndexError:
+                pass
 
     def _get_previous_file_index(self):
-        if len(self.stack_history) > 1:
-            last = len(self.stack_history)-1
-            w_id = self.stack_history.pop(last)
-            self.stack_history.insert(0, w_id)
-            last_id = self.stack_history[last]
-            for _i in range(self.tabs.count()):
-                if id(self.tabs.widget(_i)) == last_id:
-                    return _i
+        """Return the penultimate element of the stack history."""
+        try:
+            return self.stack_history[-2]
+        except IndexError:
+            return None
 
-    def go_to_previous_file(self):
-        """Ctrl+Tab"""
-        prev_index = self._get_previous_file_index()
-        if prev_index is not None:
-            self.set_stack_index(prev_index)
-        elif len(self.stack_history) == 0 and self.get_stack_count():
-            self.stack_history = [id(self.tabs.currentWidget())]
+    def tab_navigation_mru(self, forward=True):
+        """
+        Tab navigation with "most recently used" behaviour.
 
-    def go_to_next_file(self):
-        """Ctrl+Shift+Tab"""
-        if len(self.stack_history) > 1:
-            last = len(self.stack_history)-1
-            w_id = self.stack_history.pop(0)
-            self.stack_history.append(w_id)
-            last_id = self.stack_history[last]
-            for _i in range(self.tabs.count()):
-                if id(self.tabs.widget(_i)) == last_id:
-                    self.set_stack_index(_i)
-                    break
-        elif len(self.stack_history) == 0 and self.get_stack_count():
-            self.stack_history = [id(self.tabs.currentWidget())]
+        It's fired when pressing 'go to previous file' or 'go to next file'
+        shortcuts.
+
+        forward:
+            True: move to next file
+            False: move to previous file
+        """
+        self.tabs_switcher = TabSwitcherWidget(self, self.stack_history,
+                                               self.tabs)
+        self.tabs_switcher.show()
+        self.tabs_switcher.select_row(1 if forward else -1)
+        self.tabs_switcher.setFocus()
 
     def focus_changed(self):
         """Editor focus has changed"""
@@ -1579,12 +2069,16 @@ class EditorStack(QWidget):
 
         elif not osp.isfile(finfo.filename):
             # File doesn't exist (removed, moved or offline):
-            answer = QMessageBox.warning(self, self.title,
-                                _("<b>%s</b> is unavailable "
-                                  "(this file may have been removed, moved "
-                                  "or renamed outside Spyder)."
-                                  "<br>Do you want to close it?") % name,
-                                QMessageBox.Yes | QMessageBox.No)
+            self.msgbox = QMessageBox(
+                    QMessageBox.Warning,
+                    self.title,
+                    _("<b>%s</b> is unavailable "
+                      "(this file may have been removed, moved "
+                      "or renamed outside Spyder)."
+                      "<br>Do you want to close it?") % name,
+                    QMessageBox.Yes | QMessageBox.No,
+                    self)
+            answer = self.msgbox.exec_()
             if answer == QMessageBox.Yes:
                 self.close_file(index)
             else:
@@ -1598,12 +2092,15 @@ class EditorStack(QWidget):
             if to_text_string(lastm.toString()) \
                != to_text_string(finfo.lastmodified.toString()):
                 if finfo.editor.document().isModified():
-                    answer = QMessageBox.question(self,
-                                self.title,
-                                _("<b>%s</b> has been modified outside Spyder."
-                                  "<br>Do you want to reload it and lose all "
-                                  "your changes?") % name,
-                                QMessageBox.Yes | QMessageBox.No)
+                    self.msgbox = QMessageBox(
+                        QMessageBox.Question,
+                        self.title,
+                        _("<b>%s</b> has been modified outside Spyder."
+                          "<br>Do you want to reload it and lose all "
+                          "your changes?") % name,
+                        QMessageBox.Yes | QMessageBox.No,
+                        self)
+                    answer = self.msgbox.exec_()  
                     if answer == QMessageBox.Yes:
                         self.reload(index)
                     else:
@@ -1671,6 +2168,7 @@ class EditorStack(QWidget):
         # Refreshing eol mode
         eol_chars = finfo.editor.get_line_separator()
         self.refresh_eol_chars(eol_chars)
+        self.stack_history.refresh()
 
     def refresh_eol_chars(self, eol_chars):
         os_name = sourcecode.get_os_name_from_eol_chars(eol_chars)
@@ -1704,11 +2202,15 @@ class EditorStack(QWidget):
         finfo = self.data[index]
         filename = finfo.filename
         if finfo.editor.document().isModified():
-            answer = QMessageBox.warning(self, self.title,
-                                _("All changes to <b>%s</b> will be lost."
-                                  "<br>Do you want to revert file from disk?"
-                                  ) % osp.basename(filename),
-                                  QMessageBox.Yes|QMessageBox.No)
+            self.msgbox = QMessageBox(
+                    QMessageBox.Warning,
+                    self.title,
+                    _("All changes to <b>%s</b> will be lost."
+                      "<br>Do you want to revert file from disk?"
+                      ) % osp.basename(filename),
+                    QMessageBox.Yes | QMessageBox.No,
+                    self)
+            answer = self.msgbox.exec_()  
             if answer != QMessageBox.Yes:
                 return
         self.reload(index)
@@ -1747,6 +2249,7 @@ class EditorStack(QWidget):
         editor.setup_editor(
                 linenumbers=self.linenumbers_enabled,
                 show_blanks=self.blanks_enabled,
+                scroll_past_end=self.scrollpastend_enabled,
                 edge_line=self.edgeline_enabled,
                 edge_line_columns=self.edgeline_columns, language=language,
                 markers=self.has_markers(), font=self.default_font,
@@ -1769,7 +2272,9 @@ class EditorStack(QWidget):
                 indent_chars=self.indent_chars,
                 tab_stop_width_spaces=self.tab_stop_width_spaces,
                 cloned_from=cloned_from,
-                filename=fname)
+                filename=fname,
+                show_class_func_dropdown=self.show_class_func_dropdown,
+                indent_guides=self.indent_guides)
         if cloned_from is None:
             editor.set_text(txt)
             editor.document().setModified(False)
@@ -1787,15 +2292,15 @@ class EditorStack(QWidget):
         editor.zoom_out.connect(lambda: self.zoom_out.emit())
         editor.zoom_reset.connect(lambda: self.zoom_reset.emit())
         editor.sig_eol_chars_changed.connect(lambda eol_chars: self.refresh_eol_chars(eol_chars))
-        if self.outlineexplorer is not None:
-            # Removing editor reference from outline explorer settings:
-            editor.destroyed.connect(lambda obj=editor:
-                                     self.outlineexplorer.remove_editor(obj))
 
         self.find_widget.set_editor(editor)
 
         self.refresh_file_dependent_actions.emit()
         self.modification_changed(index=self.data.index(finfo))
+
+        # Needs to reset the highlighting on startup in case the PygmentsSH
+        # is in use
+        editor.run_pygments_highlighter()
 
         return finfo
 
@@ -1833,7 +2338,8 @@ class EditorStack(QWidget):
         finfo = self.create_new_editor(filename, encoding, text,
                                        set_current=False, new=True)
         finfo.editor.set_cursor_position('eof')
-        finfo.editor.insert_text(os.linesep)
+        if not default_content:
+            finfo.editor.insert_text(os.linesep)
         if default_content:
             finfo.default = True
             finfo.editor.document().setModified(False)
@@ -1856,20 +2362,34 @@ class EditorStack(QWidget):
         if self.isVisible() and self.checkeolchars_enabled \
            and sourcecode.has_mixed_eol_chars(text):
             name = osp.basename(filename)
-            QMessageBox.warning(self, self.title,
-                                _("<b>%s</b> contains mixed end-of-line "
-                                  "characters.<br>Spyder will fix this "
-                                  "automatically.") % name,
-                                QMessageBox.Ok)
+            self.msgbox = QMessageBox(
+                    QMessageBox.Warning,
+                    self.title,
+                    _("<b>%s</b> contains mixed end-of-line "
+                      "characters.<br>Spyder will fix this "
+                      "automatically.") % name,
+                    QMessageBox.Ok,
+                    self)
+            self.msgbox.exec_()
             self.set_os_eol_chars(index)
         self.is_analysis_done = False
         return finfo
 
-    def set_os_eol_chars(self, index=None):
+    def set_os_eol_chars(self, index=None, osname=None):
+        """Sets the EOL character(s) based on the operating system.
+        
+        If `osname` is None, then the default line endings for the current
+        operating system (`os.name` value) will be used.
+        
+        `osname` can be one of:
+            ('posix', 'nt', 'java')
+        """
+        if osname is None:
+            osname = os.name
         if index is None:
             index = self.get_stack_index()
         finfo = self.data[index]
-        eol_chars = sourcecode.get_eol_chars_from_os_name(os.name)
+        eol_chars = sourcecode.get_eol_chars_from_os_name(osname)
         finfo.editor.set_eol_chars(eol_chars)
         finfo.editor.document().setModified(True)
 
@@ -1923,14 +2443,26 @@ class EditorStack(QWidget):
     def run_cell_and_advance(self):
         """Run current cell and advance to the next one"""
         self.run_cell()
+        self.advance_cell()
+
+    def advance_cell(self, reverse=False):
+        """Advance to the next cell.
+
+        reverse = True --> go to previous cell.
+        """
+        if not reverse:
+            move_func = self.get_current_editor().go_to_next_cell
+        else:
+            move_func = self.get_current_editor().go_to_previous_cell
+
         if self.focus_to_editor:
-            self.get_current_editor().go_to_next_cell()
+            move_func()
         else:
             term = QApplication.focusWidget()
-            self.get_current_editor().go_to_next_cell()
+            move_func()
             term.setFocus()
             term = QApplication.focusWidget()
-            self.get_current_editor().go_to_next_cell()
+            move_func()
             term.setFocus()
 
     def re_run_last_cell(self):
@@ -1946,7 +2478,10 @@ class EditorStack(QWidget):
         source = event.mimeData()
         # The second check is necessary on Windows, where source.hasUrls()
         # can return True but source.urls() is []
-        if source.hasUrls() and source.urls():
+        # The third check is needed since a file could be dropped from
+        # compressed files. In Windows mimedata2url(source) returns None
+        # Fixes issue 5218
+        if source.hasUrls() and source.urls() and mimedata2url(source):
             all_urls = mimedata2url(source)
             text = [encoding.is_text_file(url) for url in all_urls]
             if any(text):
@@ -1982,8 +2517,27 @@ class EditorStack(QWidget):
 
 
 class EditorSplitter(QSplitter):
+    """QSplitter for editor windows."""
+
     def __init__(self, parent, plugin, menu_actions, first=False,
                  register_editorstack_cb=None, unregister_editorstack_cb=None):
+        """Create a splitter for dividing an editor window into panels.
+
+        Adds a new EditorStack instance to this splitter.  If it's not
+        the first splitter, clones the current EditorStack from the plugin.
+
+        Args:
+            parent: Parent widget.
+            plugin: Plugin this widget belongs to.
+            menu_actions: QActions to include from the parent.
+            first: Boolean if this is the first splitter in the editor.
+            register_editorstack_cb: Callback to register the EditorStack.
+                        Defaults to plugin.register_editorstack() to
+                        register the EditorStack with the Editor plugin.
+            unregister_editorstack_cb: Callback to unregister the EditorStack.
+                        Defaults to plugin.unregister_editorstack() to
+                        unregister the EditorStack with the Editor plugin.
+        """
         QSplitter.__init__(self, parent)
         self.setAttribute(Qt.WA_DeleteOnClose)
         self.setChildrenCollapsible(False)
@@ -2006,13 +2560,19 @@ class EditorSplitter(QSplitter):
         if not first:
             self.plugin.clone_editorstack(editorstack=self.editorstack)
         self.editorstack.destroyed.connect(lambda: self.editorstack_closed())
-        self.editorstack.split_vertically.connect(
+        self.editorstack.sig_split_vertically.connect(
                      lambda: self.split(orientation=Qt.Vertical))
-        self.editorstack.split_horizontally.connect(
+        self.editorstack.sig_split_horizontally.connect(
                      lambda: self.split(orientation=Qt.Horizontal))
+        self.editorstack.sig_close_split.connect(lambda: self.close())
         self.addWidget(self.editorstack)
 
     def closeEvent(self, event):
+        """Override QWidget closeEvent().
+
+        This event handler is called with the given event when Qt
+        receives a window close request from a top-level widget.
+        """
         QSplitter.closeEvent(self, event)
         if is_pyqt46:
             self.destroyed.emit()
@@ -2063,6 +2623,16 @@ class EditorSplitter(QSplitter):
         self.__give_focus_to_remaining_editor()
 
     def split(self, orientation=Qt.Vertical):
+        """Create and attach a new EditorSplitter to the current EditorSplitter.
+
+        The new EditorSplitter widget will contain an EditorStack that
+        is a clone of the current EditorStack.
+
+        A single EditorSplitter instance can be split multiple times, but the
+        orientation will be the same for all the direct splits.  If one of
+        the child splits is split, then that split can have a different
+        orientation.
+        """
         self.setOrientation(orientation)
         self.editorstack.set_orientation(orientation)
         editorsplitter = EditorSplitter(self.parent(), self.plugin,
@@ -2076,6 +2646,14 @@ class EditorSplitter(QSplitter):
             current_editor.setFocus()
 
     def iter_editorstacks(self):
+        """Return the editor stacks for this splitter and every first child.
+
+        Note: If a splitter contains more than one splitter as a direct
+              child, only the first child's editor stack is included.
+
+        Returns:
+            List of tuples containing (EditorStack instance, orientation).
+        """
         editorstacks = [(self.widget(0), self.orientation())]
         if self.count() > 1:
             editorsplitter = self.widget(1)
@@ -2083,18 +2661,60 @@ class EditorSplitter(QSplitter):
         return editorstacks
 
     def get_layout_settings(self):
-        """Return layout state"""
+        """Return the layout state for this splitter and its children.
+
+        Record the current state, including file names and current line
+        numbers, of the splitter panels.
+
+        Returns:
+            A dictionary containing keys {hexstate, sizes, splitsettings}.
+                hexstate: String of saveState() for self.
+                sizes: List for size() for self.
+                splitsettings: List of tuples of the form
+                       (orientation, cfname, clines) for each EditorSplitter
+                       and its EditorStack.
+                           orientation: orientation() for the editor
+                                 splitter (which may be a child of self).
+                           cfname: EditorStack current file name.
+                           clines: Current line number for each file in the
+                               EditorStack.
+        """
         splitsettings = []
         for editorstack, orientation in self.iter_editorstacks():
-            clines = [finfo.editor.get_cursor_line_number()
-                      for finfo in editorstack.data]
-            cfname = editorstack.get_current_filename()
+            clines = []
+            cfname = ''
+            # XXX - this overrides value from the loop to always be False?
+            orientation = False
+            if hasattr(editorstack, 'data'):
+                clines = [finfo.editor.get_cursor_line_number()
+                          for finfo in editorstack.data]
+                cfname = editorstack.get_current_filename()
             splitsettings.append((orientation == Qt.Vertical, cfname, clines))
         return dict(hexstate=qbytearray_to_str(self.saveState()),
                     sizes=self.sizes(), splitsettings=splitsettings)
 
     def set_layout_settings(self, settings, dont_goto=None):
-        """Restore layout state."""
+        """Restore layout state for the splitter panels.
+
+        Apply the settings to restore a saved layout within the editor.  If
+        the splitsettings key doesn't exist, then return without restoring
+        any settings.
+
+        The current EditorSplitter (self) calls split() for each element
+        in split_settings, thus recreating the splitter panels from the saved
+        state.  split() also clones the editorstack, which is then
+        iterated over to restore the saved line numbers on each file.
+
+        The size and positioning of each splitter panel is restored from
+        hexstate.
+
+        Args:
+            settings: A dictionary with keys {hexstate, sizes, orientation}
+                    that define the layout for the EditorSplitter panels.
+            dont_goto: Defaults to None, which positions the cursor to the
+                    end of the editor.  If there's a value, positions the
+                    cursor on the saved line number for each editor.
+        """
         splitsettings = settings.get('splitsettings')
         if splitsettings is None:
             return
@@ -2424,7 +3044,6 @@ class EditorPluginExample(QSplitter):
         editorstack.file_saved.connect(self.file_saved_in_editorstack)
         editorstack.file_renamed_in_data.connect(
                                       self.file_renamed_in_data_in_editorstack)
-        editorstack.create_new_window.connect(self.create_new_window)
         editorstack.plugin_load.connect(self.load)
 
     def unregister_editorstack(self, editorstack):
@@ -2462,32 +3081,35 @@ class EditorPluginExample(QSplitter):
     def get_focus_widget(self):
         pass
 
-    @Slot(str, int)
-    def close_file_in_all_editorstacks(self, editorstack_id_str, index):
+    @Slot(str, str)
+    def close_file_in_all_editorstacks(self, editorstack_id_str, filename):
         for editorstack in self.editorstacks:
             if str(id(editorstack)) != editorstack_id_str:
                 editorstack.blockSignals(True)
+                index = editorstack.get_index_from_filename(filename)
                 editorstack.close_file(index, force=True)
                 editorstack.blockSignals(False)
 
     # This method is never called in this plugin example. It's here only
     # to show how to use the file_saved signal (see above).
-    @Slot(str, int, str)
-    def file_saved_in_editorstack(self, editorstack_id_str, index, filename):
+    @Slot(str, str, str)
+    def file_saved_in_editorstack(self, editorstack_id_str,
+                                  original_filename, filename):
         """A file was saved in editorstack, this notifies others"""
         for editorstack in self.editorstacks:
             if str(id(editorstack)) != editorstack_id_str:
-                editorstack.file_saved_in_other_editorstack(index, filename)
+                editorstack.file_saved_in_other_editorstack(original_filename,
+                                                            filename)
 
     # This method is never called in this plugin example. It's here only
     # to show how to use the file_saved signal (see above).
-    @Slot(str, int, str)
+    @Slot(str, str, str)
     def file_renamed_in_data_in_editorstack(self, editorstack_id_str,
-                                            index, filename):
+                                            original_filename, filename):
         """A file was renamed in data in editorstack, this notifies others"""
         for editorstack in self.editorstacks:
             if str(id(editorstack)) != editorstack_id_str:
-                editorstack.rename_in_data(index, filename)
+                editorstack.rename_in_data(original_filename, filename)
 
     def register_widget_shortcuts(self, widget):
         """Fake!"""

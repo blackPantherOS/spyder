@@ -33,6 +33,7 @@ ALL_LANGUAGES = {
                  'Cpp': ('c', 'cc', 'cpp', 'cxx', 'h', 'hh', 'hpp', 'hxx'),
                  'OpenCL': ('cl',),
                  'Yaml':('yaml','yml'),
+                 "Markdown": ('md', 'mdw'),
                  }
 
 PYTHON_LIKE_LANGUAGES = ('Python', 'Cython', 'Enaml')
@@ -70,9 +71,9 @@ def has_mixed_eol_chars(text):
     return repr(correct_text) != repr(text)
 
 
-def fix_indentation(text):
+def fix_indentation(text, indent_chars):
     """Replace tabs by spaces"""
-    return text.replace('\t', ' '*4)
+    return text.replace('\t', indent_chars)
 
     
 def is_builtin(text):
@@ -182,7 +183,7 @@ def differentiate_prefix(path_components0, path_components1):
             path_0 = '/'
     return path_0
 
-def get_file_title(files_path_list, filename):
+def disambiguate_fname(files_path_list, filename):
     """Get tab title without ambiguation."""
     fname = os.path.basename(filename)
     same_name_files = get_same_name_files(files_path_list, fname)

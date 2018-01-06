@@ -1,31 +1,47 @@
 # Minor release to list
 
-**Subject**: [ANN] Spyder 3.1.3 is released!
+**Subject**: [ANN] Spyder 3.2.5 is released!
 
 
 Hi all,
 
 On the behalf of the [Spyder Project Contributors](https://github.com/spyder-ide/spyder/graphs/contributors),
-I'm pleased to announce that Spyder **3.1.3** has been released and is available for
+I'm pleased to announce that Spyder **3.2.5** has been released and is available for
 Windows, GNU/Linux and MacOS X: https://github.com/spyder-ide/spyder/releases
 
-This release comes almost one month after version 3.1.2 and fixes several
-crashes and segfaults introduced in the 3.1 series, so everyone is encouraged
-to update to this version.
+This release comes 10 weeks after version 3.2.4 and it adds the following new
+features:
 
-In this release we also fixed 25 issues and merged 29 pull requests that amount
-to almost 150 commits. For a full list of fixes, please see our
-[changelog](https://github.com/spyder-ide/spyder/blob/3.x/CHANGELOG.md)
+- IPython Console
+    * Improve kernel startup time.
+    * Add option to show kernel elapsed time.
+    * Add button and option to remove all user-defined variables.
+    * Load `%autoreload` magic at kernel startup to make changes to
+      modules take effect instantly in the console.
+    * Use `cloudpickle` to serialize/deserialize data between kernels
+      and Spyder.
+
+- Variable Explorer
+    * Add support for `datetime.timedelta` objects.
+
+- Under the hood
+    * Add `pyqt5` as a new wheel dependency.
+    * Add a new `--hide-console` option and deprecate `--show-console`
+      on Windows.
+
+In this release we fixed 45 issues and merged 54 pull requests that amount
+to more than 200 commits. For a full list of fixes, please see our
+[Changelog](https://github.com/spyder-ide/spyder/blob/3.x/CHANGELOG.md).
 
 Don't forget to follow Spyder updates/news on the project
-[Github website](https://github.com/spyder-ide/spyder)
+[Github website](https://github.com/spyder-ide/spyder).
 
 Last, but not least, we welcome any contribution that helps making Spyder an
 efficient scientific development and computing environment. Join us to help
 creating your favorite environment!
 
-Enjoy!<br>
-- Carlos
+Enjoy!
+Carlos
 
 
 ----
@@ -99,7 +115,7 @@ Enjoy!<br>
 # Major release to others
 
 **Note**: Leave this free of Markdown because it could go to mailing lists that
-don't support it.
+don't support hmtl.
 
 **Subject**: [ANN] Spyder 3.0 is released!
 

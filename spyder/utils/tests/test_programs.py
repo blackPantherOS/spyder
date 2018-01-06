@@ -18,7 +18,7 @@ from spyder.utils.programs import (run_python_script_in_terminal,
 
 
 if os.name == 'nt':
-    python_dir = os.environ['PYTHON']
+    python_dir = os.environ['PYTHON'] if os.environ.get('CI', None) else ''
     VALID_INTERPRETER = os.path.join(python_dir, 'python.exe')
     INVALID_INTERPRETER = os.path.join(python_dir, 'Scripts', 'ipython.exe')
 else:
@@ -27,6 +27,7 @@ else:
     INVALID_INTERPRETER = os.path.join(home_dir, 'miniconda', 'bin', 'ipython')
 
 
+@flaky(max_runs=3)
 @pytest.mark.skipif(os.name == 'nt' or os.environ.get('CI', None) is None,
                     reason='gets stuck on Windows and fails sometimes locally') # FIXME
 def test_run_python_script_in_terminal(tmpdir, qtbot):
@@ -42,7 +43,7 @@ def test_run_python_script_in_terminal(tmpdir, qtbot):
     assert res == 'done'
 
 
-@flaky(max_runs=10)
+@flaky(max_runs=3)
 @pytest.mark.skipif(os.name == 'nt' or os.environ.get('CI', None) is None,
                     reason='gets stuck on Windows and fails sometimes locally') # FIXME
 def test_run_python_script_in_terminal_with_wdir_empty(tmpdir, qtbot):

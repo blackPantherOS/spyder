@@ -218,7 +218,7 @@ else:
 #==============================================================================
 EXTLIST = ['.mo', '.svg', '.png', '.css', '.html', '.js', '.chm', '.ini',
            '.txt', '.rst', '.qss', '.ttf', '.json', '.c', '.cpp', '.java',
-           '.md', '.R', '.csv', '.pyx']
+           '.md', '.R', '.csv', '.pyx', '.ipynb']
 if os.name == 'nt':
     SCRIPTS += ['spyder.bat']
     EXTLIST += ['.ico']
@@ -272,7 +272,8 @@ if any(arg == 'bdist_wheel' for arg in sys.argv):
     import setuptools     # analysis:ignore
 
 install_requires = [
-    'rope_py3k' if PY3 else 'rope>=0.9.4',
+    'cloudpickle',
+    'rope>=0.10.5',
     'jedi>=0.9.0',
     'pyflakes',
     'pygments>=2.0',
@@ -283,19 +284,27 @@ install_requires = [
     'pylint',
     'psutil',
     'qtawesome>=0.4.1',
-    'qtpy>=1.1.0',
+    'qtpy>=1.2.0',
     'pickleshare',
     'pyzmq',
     'chardet>=2.0.0',
     'numpydoc',
+    # Packages for pyqt5 are only available in
+    # Python 3
+    'pyqt5;python_version>="3"',
+    # This is only needed for our wheels on Linux.
+    # See issue #3332
+    'pyopengl;platform_system=="Linux"'
 ]
 
 extras_require = {
     'test:python_version == "2.7"': ['mock'],
     'test': ['pytest',
              'pytest-qt',
+             'pytest-mock',
              'pytest-cov',
              'pytest-xvfb',
+             'pytest-timeout',
              'mock',
              'flaky',
              'pandas',

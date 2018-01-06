@@ -23,7 +23,6 @@ from qtpy.QtWebEngineWidgets import QWebEnginePage, WEBENGINE
 from spyder import dependencies
 from spyder.config.base import _, get_conf_path, get_module_source_path
 from spyder.config.fonts import DEFAULT_SMALL_DELTA
-from spyder.config.ipython import QTCONSOLE_INSTALLED
 from spyder.api.plugins import SpyderPluginWidget
 from spyder.api.preferences import PluginConfigPage
 from spyder.py3compat import get_meth_class_inst, to_text_string
@@ -32,7 +31,8 @@ from spyder.utils import programs
 from spyder.utils.help.sphinxify import (CSS_PATH, generate_context,
                                          sphinxify, usage, warning)
 from spyder.utils.qthelpers import (add_actions, create_action,
-                                    create_toolbutton)
+                                    create_toolbutton, create_plugin_layout,
+                                    MENU_SEPARATOR)
 from spyder.widgets.browser import FrameWebView
 from spyder.widgets.comboboxes import EditableComboBox
 from spyder.widgets.findreplace import FindReplace
@@ -122,16 +122,12 @@ class HelpConfigPage(PluginConfigPage):
             editor_tip = _("This feature requires the Rope or Jedi libraries.\n"
                            "It seems you don't have either installed.")
             editor_box.setToolTip(editor_tip)
-        python_box = self.create_checkbox(_("Python Console"),
-                                          'connect/python_console')
         ipython_box = self.create_checkbox(_("IPython Console"),
                                            'connect/ipython_console')
-        ipython_box.setEnabled(QTCONSOLE_INSTALLED)
 
         connections_layout = QVBoxLayout()
         connections_layout.addWidget(connections_label)
         connections_layout.addWidget(editor_box)
-        connections_layout.addWidget(python_box)
         connections_layout.addWidget(ipython_box)
         connections_group.setLayout(connections_layout)
 
@@ -430,15 +426,13 @@ class Help(SpyderPluginWidget):
         self._update_lock_icon()
 
         # Option menu
-        options_button = create_toolbutton(self, text=_('Options'),
-                                           icon=ima.icon('tooloptions'))
-        options_button.setPopupMode(QToolButton.InstantPopup)
-        menu = QMenu(self)
-        add_actions(menu, [self.rich_text_action, self.plain_text_action,
-                           self.show_source_action, None,
-                           self.auto_import_action])
-        options_button.setMenu(menu)
-        layout_edit.addWidget(options_button)
+        self.menu = QMenu(self)
+        add_actions(self.menu, [self.rich_text_action, self.plain_text_action,
+                                self.show_source_action, MENU_SEPARATOR,
+                                self.auto_import_action, MENU_SEPARATOR,
+                                self.undock_action])
+        self.options_button.setMenu(self.menu)
+        layout_edit.addWidget(self.options_button)
 
         if self.rich_help:
             self.switch_to_rich_text()
@@ -449,9 +443,8 @@ class Help(SpyderPluginWidget):
         self.source_changed()
 
         # Main layout
-        layout = QVBoxLayout()
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.addLayout(layout_edit)
+        layout = create_plugin_layout(layout_edit)
+        # we have two main widgets, but only one of them is shown at a time
         layout.addWidget(self.plain_text)
         layout.addWidget(self.rich_text)
         self.setLayout(layout)
@@ -543,9 +536,7 @@ class Help(SpyderPluginWidget):
 
         # To make auto-connection changes take place instantly
         self.main.editor.apply_plugin_settings(options=[connect_n])
-        self.main.extconsole.apply_plugin_settings(options=[connect_n])
-        if self.main.ipyconsole is not None:
-            self.main.ipyconsole.apply_plugin_settings(options=[connect_n])
+        self.main.ipyconsole.apply_plugin_settings(options=[connect_n])
 
     #------ Public API (related to Help's source) -------------------------
     def source_is_console(self):
@@ -812,8 +803,8 @@ class Help(SpyderPluginWidget):
                and (force or text != self._last_texts[index]):
                 dockwidgets = self.main.tabifiedDockWidgets(self.dockwidget)
                 if self.main.console.dockwidget not in dockwidgets and \
-                   (hasattr(self.main, 'extconsole') and \
-                    self.main.extconsole.dockwidget not in dockwidgets):
+                   (hasattr(self.main, 'ipyconsole') and \
+                    self.main.ipyconsole.dockwidget not in dockwidgets):
                     self.dockwidget.show()
                     self.dockwidget.raise_()
         self._last_texts[index] = text
@@ -891,14 +882,14 @@ class Help(SpyderPluginWidget):
         Return shell which is currently bound to Help,
         or another running shell if it has been terminated
         """
-        if not hasattr(self.shell, 'get_doc') or not self.shell.is_running():
+        if (not hasattr(self.shell, 'get_doc') or
+                (hasattr(self.shell, 'is_running') and
+                 not self.shell.is_running())):
             self.shell = None
             if self.main.ipyconsole is not None:
                 shell = self.main.ipyconsole.get_current_shellwidget()
                 if shell is not None and shell.kernel_client is not None:
                     self.shell = shell
-            if self.shell is None and self.main.extconsole is not None:
-                self.shell = self.main.extconsole.get_running_python_shell()
             if self.shell is None:
                 self.shell = self.internal_shell
         return self.shell

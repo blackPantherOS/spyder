@@ -9,15 +9,20 @@ Shell Widget for the IPython Console
 """
 
 import ast
+import os
 import uuid
 
 from qtpy.QtCore import Signal
 from qtpy.QtWidgets import QMessageBox
-
+from spyder.config.main import CONF
 from spyder.config.base import _
 from spyder.config.gui import config_shortcut
-from spyder.py3compat import to_text_string
+from spyder.py3compat import PY2, to_text_string
+from spyder.utils import encoding
 from spyder.utils import programs
+from spyder.utils import syntaxhighlighters as sh
+from spyder.utils.ipython.style import create_qss_style, create_style_class
+from spyder.widgets.helperwidgets import MessageCheckBox
 from spyder.widgets.ipythonconsole import (ControlWidget, DebuggingWidget,
                                            HelpWidget, NamepaceBrowserWidget,
                                            PageControlWidget)
@@ -35,18 +40,22 @@ class ShellWidget(NamepaceBrowserWidget, HelpWidget, DebuggingWidget):
     # For NamepaceBrowserWidget
     sig_namespace_view = Signal(object)
     sig_var_properties = Signal(object)
+    sig_show_syspath = Signal(object)
+    sig_show_env = Signal(object)
 
     # For DebuggingWidget
-    sig_input_reply = Signal()
     sig_pdb_step = Signal(str, int)
-    sig_prompt_ready = Signal()
-    sig_dbg_kernel_restart = Signal()
 
     # For ShellWidget
     focus_changed = Signal()
     new_client = Signal()
     sig_got_reply = Signal()
+    sig_is_spykernel = Signal(object)
     sig_kernel_restarted = Signal(str)
+    sig_prompt_ready = Signal()
+
+    # For global working directory
+    sig_change_cwd = Signal(str)
 
     def __init__(self, ipyclient, additional_options, interpreter_versions,
                  external_kernel, *args, **kw):
@@ -59,8 +68,7 @@ class ShellWidget(NamepaceBrowserWidget, HelpWidget, DebuggingWidget):
         self.additional_options = additional_options
         self.interpreter_versions = interpreter_versions
         self.external_kernel = external_kernel
-
-        self.set_background_color()
+        self._cwd = ''
 
         # Keyboard shortcuts
         self.shortcuts = self.create_shortcuts()
@@ -68,6 +76,11 @@ class ShellWidget(NamepaceBrowserWidget, HelpWidget, DebuggingWidget):
         # To save kernel replies in silent execution
         self._kernel_reply = None
 
+        # Set the color of the matched parentheses here since the qtconsole
+        # uses a hard-coded value that is not modified when the color scheme is
+        # set in the qtconsole constructor. See issue #4806.   
+        self.set_bracket_matcher_color_scheme(self.syntax_style)
+                
     #---- Public API ----------------------------------------------------------
     def set_exit_callback(self):
         """Set exit callback for this shell."""
@@ -80,10 +93,74 @@ class ShellWidget(NamepaceBrowserWidget, HelpWidget, DebuggingWidget):
         else:
             return False
 
+    def is_spyder_kernel(self):
+        """Determine if the kernel is from Spyder."""
+        code = u"getattr(get_ipython().kernel, 'set_value', False)"
+        if self._reading:
+            return
+        else:
+            self.silent_exec_method(code)
+
     def set_cwd(self, dirname):
         """Set shell current working directory."""
-        return self.silent_execute(
-            u"get_ipython().kernel.set_cwd(r'{}')".format(dirname))
+        # Replace single for double backslashes on Windows
+        if os.name == 'nt':
+            dirname = dirname.replace(u"\\", u"\\\\")
+
+        if not self.external_kernel:
+            code = u"get_ipython().kernel.set_cwd(u'{}')".format(dirname)
+            if self._reading:
+                self.kernel_client.input(u'!' + code)
+            else:
+                self.silent_execute(code)
+            self._cwd = dirname
+
+    def get_cwd(self):
+        """Update current working directory.
+
+        Retrieve the cwd and emit a signal connected to the working directory
+        widget. (see: handle_exec_method())
+        """
+        code = u"get_ipython().kernel.get_cwd()"
+        if self._reading:
+            return
+        else:
+            self.silent_exec_method(code)
+            
+    def set_bracket_matcher_color_scheme(self, color_scheme):
+        """Set color scheme for matched parentheses."""
+        bsh = sh.BaseSH(parent=self, color_scheme=color_scheme)
+        mpcolor = bsh.get_matched_p_color()
+        self._bracket_matcher.format.setBackground(mpcolor)
+
+    def set_color_scheme(self, color_scheme):
+        """Set color scheme of the shell."""
+        self.set_bracket_matcher_color_scheme(color_scheme)
+        self.style_sheet, dark_color = create_qss_style(color_scheme)
+        self.syntax_style = color_scheme
+        self._style_sheet_changed()
+        self._syntax_style_changed()
+        self.reset(clear=True)
+        if not dark_color:
+            self.silent_execute("%colors linux")
+        else:
+            self.silent_execute("%colors lightbg")
+
+    def get_syspath(self):
+        """Ask the kernel for sys.path contents."""
+        code = u"get_ipython().kernel.get_syspath()"
+        if self._reading:
+            return
+        else:
+            self.silent_exec_method(code)
+
+    def get_env(self):
+        """Ask the kernel for environment variables."""
+        code = u"get_ipython().kernel.get_env()"
+        if self._reading:
+            return
+        else:
+            self.silent_exec_method(code)
 
     # --- To handle the banner
     def long_banner(self):
@@ -141,57 +218,95 @@ the sympy module (e.g. plot)
 
     # --- To define additional shortcuts
     def clear_console(self):
-        self.execute("%clear")
-
-    def reset_namespace(self, force=False):
-        """Reset the namespace by removing all names defined by the user."""
-        reset_str = _("Reset IPython namespace")
-        warn_str = _("All user-defined variables will be removed."
-                     "<br>Are you sure you want to reset the namespace?")
-        if not force:
-            reply = QMessageBox.question(self, reset_str,
-                                         warn_str,
-                                         QMessageBox.Yes | QMessageBox.No
-            )
-
-            if reply == QMessageBox.Yes:
-                self.execute("%reset -f")
+        if self._reading:
+            self.dbg_exec_magic('clear')
         else:
-            self.silent_execute("%reset -f")
+            self.execute("%clear")
 
-    def set_background_color(self):
-        light_color_o = self.additional_options['light_color']
-        if not light_color_o:
-            self.set_default_style(colors='linux')
+    def _reset_namespace(self):
+        warning = CONF.get('ipython_console', 'show_reset_namespace_warning')
+        self.reset_namespace(silent=True, warning=warning)
+
+    def reset_namespace(self, warning=False, silent=True, message=False):
+        """Reset the namespace by removing all names defined by the user."""
+        reset_str = _("Remove all variables")
+        warn_str = _("All user-defined variables will be removed. "
+                     "Are you sure you want to proceed?")
+
+        if warning:
+            box = MessageCheckBox(icon=QMessageBox.Warning, parent=self)
+            box.setWindowTitle(reset_str)
+            box.set_checkbox_text(_("Don't show again."))
+            box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+            box.setDefaultButton(QMessageBox.Yes)
+
+            box.set_checked(False)
+            box.set_check_visible(True)
+            box.setText(warn_str)
+
+            answer = box.exec_()
+
+            # Update checkbox based on user interaction
+            CONF.set('ipython_console', 'show_reset_namespace_warning',
+                     not box.is_checked())
+
+            if answer != QMessageBox.Yes:
+                return
+
+        if self._reading:
+            self.dbg_exec_magic('reset', '-f')
+        else:
+            if silent:
+                if message:
+                    self.reset()
+                    self._append_html(_("<br><br>Removing all variables..."
+                                        "\n<hr>"),
+                                      before_prompt=False)
+                self.silent_execute("%reset -f")
+                self.refresh_namespacebrowser()
+            else:
+                self.execute("%reset -f")
+
+            if not self.external_kernel:
+                self.silent_execute(
+                    'get_ipython().kernel.close_all_mpl_figures()')
 
     def create_shortcuts(self):
+        """Create shortcuts for ipyconsole."""
         inspect = config_shortcut(self._control.inspect_current_object,
-                                  context='Console', name='Inspect current object',
-                                  parent=self)
+                                  context='Console',
+                                  name='Inspect current object', parent=self)
         clear_console = config_shortcut(self.clear_console, context='Console',
                                         name='Clear shell', parent=self)
         restart_kernel = config_shortcut(self.ipyclient.restart_kernel,
                                          context='ipython_console',
                                          name='Restart kernel', parent=self)
         new_tab = config_shortcut(lambda: self.new_client.emit(),
-                                  context='ipython_console', name='new tab', parent=self)
-        reset_namespace = config_shortcut(lambda: self.reset_namespace(),
+                                  context='ipython_console', name='new tab',
+                                  parent=self)
+        reset_namespace = config_shortcut(lambda: self._reset_namespace(),
                                           context='ipython_console',
                                           name='reset namespace', parent=self)
-        array_inline = config_shortcut(lambda: self.enter_array_inline(),
+        array_inline = config_shortcut(self._control.enter_array_inline,
                                        context='array_builder',
                                        name='enter array inline', parent=self)
-        array_table = config_shortcut(lambda: self.enter_array_table(),
+        array_table = config_shortcut(self._control.enter_array_table,
                                       context='array_builder',
                                       name='enter array table', parent=self)
+        clear_line = config_shortcut(self.ipyclient.clear_line,
+                                     context='console', name='clear line',
+                                     parent=self)
 
         return [inspect, clear_console, restart_kernel, new_tab,
-                reset_namespace, array_inline, array_table]
+                reset_namespace, array_inline, array_table, clear_line]
 
     # --- To communicate with the kernel
     def silent_execute(self, code):
         """Execute code in the kernel without increasing the prompt"""
-        self.kernel_client.execute(to_text_string(code), silent=True)
+        try:
+            self.kernel_client.execute(to_text_string(code), silent=True)
+        except AttributeError:
+            pass
 
     def silent_exec_method(self, code):
         """Silently execute a kernel method and save its reply
@@ -221,6 +336,9 @@ the sympy module (e.g. plot)
         # not the unique request originated from here
         local_uuid = to_text_string(uuid.uuid1())
         code = to_text_string(code)
+        if self.kernel_client is None:
+            return
+
         msg_id = self.kernel_client.execute('', silent=True,
                                             user_expressions={ local_uuid:code })
         self._kernel_methods[local_uuid] = code
@@ -245,16 +363,43 @@ the sympy module (e.g. plot)
                 data = reply.get('data')
                 if 'get_namespace_view' in method:
                     if data is not None and 'text/plain' in data:
-                        view = ast.literal_eval(data['text/plain'])
+                        literal = ast.literal_eval(data['text/plain'])
+                        view = ast.literal_eval(literal)
                     else:
                         view = None
                     self.sig_namespace_view.emit(view)
                 elif 'get_var_properties' in method:
                     if data is not None and 'text/plain' in data:
-                        properties = ast.literal_eval(data['text/plain'])
+                        literal = ast.literal_eval(data['text/plain'])
+                        properties = ast.literal_eval(literal)
                     else:
                         properties = None
                     self.sig_var_properties.emit(properties)
+                elif 'get_cwd' in method:
+                    if data is not None and 'text/plain' in data:
+                        self._cwd = ast.literal_eval(data['text/plain'])
+                        if PY2:
+                            self._cwd = encoding.to_unicode_from_fs(self._cwd)
+                    else:
+                        self._cwd = ''
+                    self.sig_change_cwd.emit(self._cwd)
+                elif 'get_syspath' in method:
+                    if data is not None and 'text/plain' in data:
+                        syspath = ast.literal_eval(data['text/plain'])
+                    else:
+                        syspath = None
+                    self.sig_show_syspath.emit(syspath)
+                elif 'get_env' in method:
+                    if data is not None and 'text/plain' in data:
+                        env = ast.literal_eval(data['text/plain'])
+                    else:
+                        env = None
+                    self.sig_show_env.emit(env)
+                elif 'getattr' in method:
+                    if data is not None and 'text/plain' in data:
+                        is_spyder_kernel = data['text/plain']
+                        if 'SpyderKernel' in is_spyder_kernel:
+                            self.sig_is_spykernel.emit(self)
                 else:
                     if data is not None and 'text/plain' in data:
                         self._kernel_reply = ast.literal_eval(data['text/plain'])
@@ -292,9 +437,17 @@ the sympy module (e.g. plot)
         """
         if command.startswith('%matplotlib') and \
           len(command.splitlines()) == 1:
-            self.silent_execute(command)
+            if not 'inline' in command:
+                self.silent_execute(command)
 
     #---- Private methods (overrode by us) ---------------------------------
+    def _handle_error(self, msg):
+        """
+        Reimplemented to reset the prompt if the error comes after the reply
+        """
+        self._process_execute_error(msg)
+        self._show_interpreter_prompt()
+
     def _context_menu_make(self, pos):
         """Reimplement the IPython context menu"""
         menu = super(ShellWidget, self)._context_menu_make(pos)
@@ -317,6 +470,23 @@ the sympy module (e.g. plot)
     def _kernel_restarted_message(self, died=True):
         msg = _("Kernel died, restarting") if died else _("Kernel restarting")
         self.sig_kernel_restarted.emit(msg)
+
+    def _syntax_style_changed(self):
+        """Refresh the highlighting with the current syntax style by class."""
+        if self._highlighter is None:
+            # ignore premature calls
+            return
+        if self.syntax_style:
+            self._highlighter._style = create_style_class(self.syntax_style)
+            self._highlighter._clear_caches()
+        else:
+            self._highlighter.set_style_sheet(self.style_sheet)
+
+    def _prompt_started_hook(self):
+        """Emit a signal when the prompt is ready."""
+        if not self._reading:
+            self._highlighter.highlighting_on = True
+            self.sig_prompt_ready.emit()
 
     #---- Qt methods ----------------------------------------------------------
     def focusInEvent(self, event):

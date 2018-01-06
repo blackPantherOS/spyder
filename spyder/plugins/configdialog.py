@@ -23,7 +23,8 @@ from qtpy.QtWidgets import (QButtonGroup, QCheckBox, QComboBox, QDialog,
                             QLineEdit, QListView, QListWidget, QListWidgetItem,
                             QMessageBox, QPushButton, QRadioButton,
                             QScrollArea, QSpinBox, QSplitter, QStackedWidget,
-                            QStyleFactory, QTabWidget, QVBoxLayout, QWidget)
+                            QStyleFactory, QTabWidget, QVBoxLayout, QWidget,
+                            QApplication)
 
 # Local imports
 from spyder.config.base import (_, LANGUAGE_CODES, load_lang_conf,
@@ -32,11 +33,15 @@ from spyder.config.gui import get_font, set_font
 from spyder.config.main import CONF
 from spyder.config.user import NoDefault
 from spyder.config.utils import is_gtk_desktop
-from spyder.py3compat import to_text_string, is_text_string, getcwd
+from spyder.py3compat import to_text_string, is_text_string
 from spyder.utils import icon_manager as ima
 from spyder.utils import syntaxhighlighters
+from spyder.utils.misc import getcwd_or_home
 from spyder.widgets.colors import ColorLayout
 from spyder.widgets.sourcecode.codeeditor import CodeEditor
+
+
+HDPI_QT_PAGE = "http://doc.qt.io/qt-5/highdpi.html"
 
 
 class ConfigAccessMixin(object):
@@ -316,10 +321,14 @@ class SpyderConfigPage(ConfigPage, ConfigAccessMixin):
             radiobutton.setChecked(self.get_option(option, default))
             radiobutton.toggled.connect(lambda _foo, opt=option:
                                         self.has_been_modified(opt))
+            if radiobutton.restart_required:
+                self.restart_options[option] = radiobutton.label_text
         for lineedit, (option, default) in list(self.lineedits.items()):
             lineedit.setText(self.get_option(option, default))
             lineedit.textChanged.connect(lambda _foo, opt=option:
                                          self.has_been_modified(opt))
+            if lineedit.restart_required:
+                self.restart_options[option] = lineedit.label_text
         for spinbox, (option, default) in list(self.spinboxes.items()):
             spinbox.setValue(self.get_option(option, default))
             spinbox.valueChanged.connect(lambda _foo, opt=option:
@@ -442,7 +451,8 @@ class SpyderConfigPage(ConfigPage, ConfigAccessMixin):
     
     def create_radiobutton(self, text, option, default=NoDefault,
                            tip=None, msg_warning=None, msg_info=None,
-                           msg_if_enabled=False, button_group=None):
+                           msg_if_enabled=False, button_group=None,
+                           restart=False):
         radiobutton = QRadioButton(text)
         if button_group is None:
             if self.default_button_group is None:
@@ -462,10 +472,13 @@ class SpyderConfigPage(ConfigPage, ConfigAccessMixin):
                         QMessageBox.information(self, self.get_name(),
                                                 msg_info, QMessageBox.Ok)
             radiobutton.toggled.connect(show_message)
+        radiobutton.restart_required = restart
+        radiobutton.label_text = text
         return radiobutton
     
     def create_lineedit(self, text, option, default=NoDefault,
-                        tip=None, alignment=Qt.Vertical, regex=None):
+                        tip=None, alignment=Qt.Vertical, regex=None, 
+                        restart=False):
         label = QLabel(text)
         label.setWordWrap(True)
         edit = QLineEdit()
@@ -482,6 +495,8 @@ class SpyderConfigPage(ConfigPage, ConfigAccessMixin):
         widget.label = label
         widget.textbox = edit 
         widget.setLayout(layout)
+        edit.restart_required = restart
+        edit.label_text = text
         return widget
     
     def create_browsedir(self, text, option, default=NoDefault, tip=None):
@@ -507,7 +522,7 @@ class SpyderConfigPage(ConfigPage, ConfigAccessMixin):
         """Select directory"""
         basedir = to_text_string(edit.text())
         if not osp.isdir(basedir):
-            basedir = getcwd()
+            basedir = getcwd_or_home()
         title = _("Select directory")
         directory = getexistingdirectory(self, title, basedir)
         if directory:
@@ -537,7 +552,7 @@ class SpyderConfigPage(ConfigPage, ConfigAccessMixin):
         """Select File"""
         basedir = osp.dirname(to_text_string(edit.text()))
         if not osp.isdir(basedir):
-            basedir = getcwd()
+            basedir = getcwd_or_home()
         if filters is None:
             filters = _("All files (*)")
         title = _("Select file")
@@ -845,18 +860,35 @@ class MainConfigPage(GeneralConfigPage):
         tear_off_box = newcb(_("Tear off menus"), 'tear_off_menus',
                              tip=_("Set this to detach any<br> "
                                    "menu from the main window"))
-        high_dpi_scaling_box = newcb(_("Enable high DPI scaling"), 
-                                     'high_dpi_scaling',
-                                     tip=_("Set this for high DPI displays"))
         margin_box = newcb(_("Custom margin for panes:"),
                            'use_custom_margin')
         margin_spin = self.create_spinbox("", _("pixels"), 'custom_margin',
                                           0, 0, 30)
-        margin_box.toggled.connect(margin_spin.setEnabled)
-        margin_spin.setEnabled(self.get_option('use_custom_margin'))
-        margins_layout = QHBoxLayout()
-        margins_layout.addWidget(margin_box)
-        margins_layout.addWidget(margin_spin)
+        margin_box.toggled.connect(margin_spin.spinbox.setEnabled)
+        margin_box.toggled.connect(margin_spin.slabel.setEnabled)
+        margin_spin.spinbox.setEnabled(self.get_option('use_custom_margin'))
+        margin_spin.slabel.setEnabled(self.get_option('use_custom_margin'))
+        
+        cursor_box = newcb(_("Cursor blinking:"),
+                           'use_custom_cursor_blinking')
+        cursor_spin = self.create_spinbox("", _("ms"), 'custom_cursor_blinking',
+                                          default = QApplication.cursorFlashTime(),
+                                          min_=0, max_=5000, step=100)
+        cursor_box.toggled.connect(cursor_spin.spinbox.setEnabled)
+        cursor_box.toggled.connect(cursor_spin.slabel.setEnabled)
+        cursor_spin.spinbox.setEnabled(
+                self.get_option('use_custom_cursor_blinking'))
+        cursor_spin.slabel.setEnabled(
+                self.get_option('use_custom_cursor_blinking'))
+        
+        margins_cursor_layout = QGridLayout()
+        margins_cursor_layout.addWidget(margin_box, 0, 0)
+        margins_cursor_layout.addWidget(margin_spin.spinbox, 0, 1)
+        margins_cursor_layout.addWidget(margin_spin.slabel, 0, 2)        
+        margins_cursor_layout.addWidget(cursor_box, 1, 0)
+        margins_cursor_layout.addWidget(cursor_spin.spinbox, 1, 1)
+        margins_cursor_layout.addWidget(cursor_spin.slabel, 1, 2)
+        margins_cursor_layout.setColumnStretch(2, 100)
 
         # Layout interface
         comboboxes_layout = QHBoxLayout()
@@ -874,8 +906,7 @@ class MainConfigPage(GeneralConfigPage):
         interface_layout.addWidget(verttabs_box)
         interface_layout.addWidget(animated_box)
         interface_layout.addWidget(tear_off_box)
-        interface_layout.addWidget(high_dpi_scaling_box)
-        interface_layout.addLayout(margins_layout)
+        interface_layout.addLayout(margins_cursor_layout)
         interface_group.setLayout(interface_layout)
 
         # --- Status bar
@@ -923,6 +954,63 @@ class MainConfigPage(GeneralConfigPage):
         sbar_layout.addLayout(cpu_memory_layout)
         sbar_group.setLayout(sbar_layout)
 
+        # --- Screen resolution Group (hidpi)
+        screen_resolution_group = QGroupBox(_("Screen resolution"))
+        screen_resolution_bg = QButtonGroup(screen_resolution_group)
+        screen_resolution_label = QLabel(_("Configuration for high DPI "
+                                           "screens<br><br>"
+                                           "Please see "
+                                           "<a href=\"{0}\">{0}</a><> "
+                                           "for more information about "
+                                           "these options (in "
+                                           "English).").format(HDPI_QT_PAGE))
+        screen_resolution_label.setWordWrap(True)
+
+        normal_radio = self.create_radiobutton(
+                                _("Normal"),
+                                'normal_screen_resolution',
+                                button_group=screen_resolution_bg)
+        auto_scale_radio = self.create_radiobutton(
+                                _("Enable auto high DPI scaling"),
+                                'high_dpi_scaling',
+                                button_group=screen_resolution_bg,
+                                tip=_("Set this for high DPI displays"),
+                                restart=True)
+
+        custom_scaling_radio = self.create_radiobutton(
+                                _("Set a custom high DPI scaling"),
+                                'high_dpi_custom_scale_factor',
+                                button_group=screen_resolution_bg,
+                                tip=_("Set this for high DPI displays when "
+                                      "auto scaling does not work"),
+                                restart=True)
+
+        custom_scaling_edit = self.create_lineedit("",
+                                'high_dpi_custom_scale_factors',
+                                tip=_("Enter values for different screens "
+                                      "separated by semicolons ';', "
+                                      "float values are supported"),
+                                alignment=Qt.Horizontal,
+                                regex="[0-9]+(?:\.[0-9]*)(;[0-9]+(?:\.[0-9]*))*",
+                                restart=True)
+
+        normal_radio.toggled.connect(custom_scaling_edit.setDisabled)
+        auto_scale_radio.toggled.connect(custom_scaling_edit.setDisabled)
+        custom_scaling_radio.toggled.connect(custom_scaling_edit.setEnabled)
+
+        # Layout Screen resolution
+        screen_resolution_layout = QVBoxLayout()
+        screen_resolution_layout.addWidget(screen_resolution_label)
+
+        screen_resolution_inner_layout = QGridLayout()
+        screen_resolution_inner_layout.addWidget(normal_radio, 0, 0)
+        screen_resolution_inner_layout.addWidget(auto_scale_radio, 1, 0)
+        screen_resolution_inner_layout.addWidget(custom_scaling_radio, 2, 0)
+        screen_resolution_inner_layout.addWidget(custom_scaling_edit, 2, 1)
+
+        screen_resolution_layout.addLayout(screen_resolution_inner_layout)
+        screen_resolution_group.setLayout(screen_resolution_layout)
+
         # --- Theme and fonts
         plain_text_font = self.create_fontgroup(
             option='font',
@@ -948,8 +1036,8 @@ class MainConfigPage(GeneralConfigPage):
         fonts_group.setLayout(fonts_layout)
 
         tabs = QTabWidget()
-        tabs.addTab(self.create_tab(fonts_group, interface_group),
-                    _("Appearance"))
+        tabs.addTab(self.create_tab(fonts_group, screen_resolution_group,
+                    interface_group), _("Appearance"))
         tabs.addTab(self.create_tab(general_group, sbar_group),
                     _("Advanced Settings"))
 
@@ -1075,6 +1163,8 @@ class ColorSchemeConfigPage(GeneralConfigPage):
     def apply_settings(self, options):
         self.set_option('selected', self.current_scheme)
         self.main.editor.apply_plugin_settings(['color_scheme_name'])
+        if self.main.ipyconsole is not None:
+            self.main.ipyconsole.apply_plugin_settings(['color_scheme_name'])
         if self.main.historylog is not None:
             self.main.historylog.apply_plugin_settings(['color_scheme_name'])
         if self.main.help is not None:
@@ -1160,6 +1250,7 @@ class ColorSchemeConfigPage(GeneralConfigPage):
                 '        print(bar)\n'
                 )
         show_blanks = CONF.get('editor', 'blank_spaces')
+        update_scrollbar = CONF.get('editor', 'scroll_past_end')
         if scheme_name is None:
             scheme_name = self.current_scheme
         self.preview_editor.setup_editor(linenumbers=True,
@@ -1167,7 +1258,8 @@ class ColorSchemeConfigPage(GeneralConfigPage):
                                          tab_mode=False,
                                          font=get_font(),
                                          show_blanks=show_blanks,
-                                         color_scheme=scheme_name)
+                                         color_scheme=scheme_name,
+                                         scroll_past_end=update_scrollbar)
         self.preview_editor.set_text(text)
         self.preview_editor.set_language('Python')
 

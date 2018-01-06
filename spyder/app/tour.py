@@ -30,6 +30,7 @@ from qtpy.QtWidgets import (QAction, QApplication, QComboBox, QDialog,
 from spyder.config.base import _, get_image_path
 from spyder.py3compat import to_binary_string
 from spyder.utils.qthelpers import add_actions, create_action
+from spyder.utils import icon_manager as ima
 
 # FIXME: Known issues
 # How to handle if an specific dockwidget does not exists/load, like ipython
@@ -38,7 +39,6 @@ from spyder.utils.qthelpers import add_actions, create_action
 class SpyderWidgets(object):
     """List of supported widgets to highlight/decorate"""
     # Panes
-    external_console = 'extconsole'
     ipython_console = 'ipyconsole'
     editor = 'editor'
     editor_line_number_area = 'editor.get_current_editor().linenumberarea'
@@ -176,21 +176,6 @@ def get_tour(index):
                            "can inspect and modify their contents."),
               'widgets': [sw.variable_explorer],
               'interact': True},
-
-             {'title': _("The Python console"),
-              'content': _("You can also run your code on a Python console. "
-                           "These consoles are useful because they let you "
-                           "run a file in a console dedicated only to it."
-                           "To select this behavior, please press the <b>F6</b> "
-                           "key.<br><br>"
-                           "By pressing the button below and then focusing the "
-                           "Variable Explorer, you will notice that "
-                           "Python consoles are also connected to that pane, "
-                           "and that the Variable Explorer only shows "
-                           "the variables of the currently focused console."),
-              'widgets': [sw.external_console],
-              'run': ["a = 2", "s='Hello, world!'"],
-              },
 
              {'title': _("Help"),
               'content': _("This pane displays documentation of the "
@@ -563,11 +548,17 @@ class FadingTipBox(FadingDialog):
         self.setModal(False)
 
         # Widgets
-        self.button_home = QPushButton("<<")
-        self.button_close = QPushButton("X")
-        self.button_previous = QPushButton(" < ")
-        self.button_end = QPushButton(">>")
-        self.button_next = QPushButton(" > ")
+        def toolbutton(icon):
+            bt = QToolButton()
+            bt.setAutoRaise(True)
+            bt.setIcon(icon)
+            return bt
+
+        self.button_close = toolbutton(ima.icon("tour.close"))
+        self.button_home = toolbutton(ima.icon("tour.home"))
+        self.button_previous = toolbutton(ima.icon("tour.previous"))
+        self.button_end = toolbutton(ima.icon("tour.end"))
+        self.button_next = toolbutton(ima.icon("tour.next"))
         self.button_run = QPushButton(_('Run code'))
         self.button_disable = None
         self.button_current = QToolButton()
@@ -593,27 +584,7 @@ class FadingTipBox(FadingDialog):
 
         arrow = get_image_path('hide.png')
 
-        self.stylesheet = '''QPushButton {
-                             background-color: rgbs(200,200,200,100%);
-                             color: rgbs(0,0,0,100%);
-                             border-style: outset;
-                             border-width: 1px;
-                             border-radius: 3px;
-                             border-color: rgbs(100,100,100,100%);
-                             padding: 2px;
-                             }
-
-                             QPushButton:hover {
-                             background-color: rgbs(150, 150, 150, 100%);
-                             }
-
-                             QPushButton:disabled {
-                             background-color: rgbs(230,230,230,100%);
-                             color: rgbs(200,200,200,100%);
-                             border-color: rgbs(200,200,200,100%);
-                             }
-
-                             QComboBox {
+        self.stylesheet = '''QComboBox {
                              padding-left: 5px;
                              background-color: rgbs(230,230,230,100%);
                              border-width: 0px;
@@ -758,7 +729,7 @@ class FadingTipBox(FadingDialog):
     def build_paths(self):
         """ """
         geo = self.geometry()
-        radius = 30
+        radius = 0
         shadow = self.offset_shadow
         x0, y0 = geo.x(), geo.y()
         width, height = geo.width() - shadow, geo.height() - shadow
@@ -928,20 +899,22 @@ class AnimatedTour(QWidget):
 
     def _resized(self, event):
         """ """
-        size = event.size()
-        self.canvas.setFixedSize(size)
-        self.canvas.update_canvas()
+        if self.is_running:
+            size = event.size()
+            self.canvas.setFixedSize(size)
+            self.canvas.update_canvas()
 
-        if self.is_tour_set:
-            self._set_data()
+            if self.is_tour_set:
+                self._set_data()
 
     def _moved(self, event):
         """ """
-        pos = event.pos()
-        self.canvas.move(QPoint(pos.x(), pos.y()))
+        if self.is_running:
+            pos = event.pos()
+            self.canvas.move(QPoint(pos.x(), pos.y()))
 
-        if self.is_tour_set:
-            self._set_data()
+            if self.is_tour_set:
+                self._set_data()
 
     def _close_canvas(self):
         """ """
@@ -1200,7 +1173,9 @@ class AnimatedTour(QWidget):
     def close_tour(self):
         """ """
         self.tips.fade_out(self._close_canvas)
-        self.tips.show()
+        self.canvas.set_interaction(False)
+        self._set_modal(True, [self.tips])
+        self.canvas.hide()
 
         try:
             # set the last played frame by updating the available tours in 

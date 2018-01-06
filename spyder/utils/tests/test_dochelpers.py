@@ -18,12 +18,15 @@ import pytest
 from spyder.utils.dochelpers import getargtxt, getdoc, getobj, isdefined
 from spyder.py3compat import PY2
 
+
 class Test(object):
     def method(self, x, y=2):
         pass
 
-@pytest.mark.skipif(not 'Continuum' in sys.version,
-                    reason="It fails when not run in Anaconda")
+
+@pytest.mark.skipif(not 'Continuum' in sys.version or not PY2,
+                    reason="It fails when not run in Anaconda and in "
+                            "Python 3")
 def test_dochelpers():
     """Test dochelpers."""
     assert not getargtxt(Test.__init__)

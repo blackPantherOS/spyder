@@ -9,14 +9,16 @@ Widget that handle communications between the IPython Console and
 the Variable Explorer
 """
 
-from qtpy.QtCore import QEventLoop
+from time import time
 
-from ipykernel.pickleutil import CannedObject
-from ipykernel.serialize import deserialize_object
+from qtpy.QtCore import QEventLoop
+from qtpy.QtWidgets import QMessageBox
+
+import cloudpickle
 from qtconsole.rich_jupyter_widget import RichJupyterWidget
 
-from spyder.config.base import _
-from spyder.py3compat import to_text_string
+from spyder.config.base import _, debug_print
+from spyder.py3compat import PY2, to_text_string
 
 
 class NamepaceBrowserWidget(RichJupyterWidget):
@@ -68,16 +70,17 @@ class NamepaceBrowserWidget(RichJupyterWidget):
 
     def get_value(self, name):
         """Ask kernel for a value"""
-        # Don't ask for values while reading (ipdb) is active
+        code = u"get_ipython().kernel.get_value('%s')" % name
         if self._reading:
-            raise ValueError(_("Inspecting and setting values while debugging "
-                               "in IPython consoles is not supported yet by "
-                               "Spyder."))
+            method = self.kernel_client.input
+            code = u'!' + code
+        else:
+            method = self.silent_execute
 
         # Wait until the kernel returns the value
         wait_loop = QEventLoop()
         self.sig_got_reply.connect(wait_loop.quit)
-        self.silent_execute("get_ipython().kernel.get_value('%s')" % name)
+        method(code)
         wait_loop.exec_()
 
         # Remove loop connection and loop
@@ -96,19 +99,37 @@ class NamepaceBrowserWidget(RichJupyterWidget):
     def set_value(self, name, value):
         """Set value for a variable"""
         value = to_text_string(value)
-        self.silent_execute("get_ipython().kernel.set_value('%s', %s)" %
-                            (name, value))
+        code = u"get_ipython().kernel.set_value('%s', %s, %s)" % (name, value,
+                                                                  PY2)
+
+        if self._reading:
+            self.kernel_client.input(u'!' + code)
+        else:
+            self.silent_execute(code)
 
     def remove_value(self, name):
         """Remove a variable"""
-        self.silent_execute("get_ipython().kernel.remove_value('%s')" % name)
+        code = u"get_ipython().kernel.remove_value('%s')" % name
+        if self._reading:
+            self.kernel_client.input(u'!' + code)
+        else:
+            self.silent_execute(code)
 
     def copy_value(self, orig_name, new_name):
         """Copy a variable"""
-        self.silent_execute("get_ipython().kernel.copy_value('%s', '%s')" %
-                            (orig_name, new_name))
+        code = u"get_ipython().kernel.copy_value('%s', '%s')" % (orig_name,
+                                                                 new_name)
+        if self._reading:
+            self.kernel_client.input(u'!' + code)
+        else:
+            self.silent_execute(code)
 
     def load_data(self, filename, ext):
+        if self._reading:
+            message = _("Loading this kind of data while debugging is not "
+                        "supported.")
+            QMessageBox.warning(self, _("Warning"), message)
+            return
         # Wait until the kernel tries to load the file
         wait_loop = QEventLoop()
         self.sig_got_reply.connect(wait_loop.quit)
@@ -123,6 +144,10 @@ class NamepaceBrowserWidget(RichJupyterWidget):
         return self._kernel_reply
 
     def save_namespace(self, filename):
+        if self._reading:
+            message = _("Saving data while debugging is not supported.")
+            QMessageBox.warning(self, _("Warning"), message)
+            return
         # Wait until the kernel tries to save the file
         wait_loop = QEventLoop()
         self.sig_got_reply.connect(wait_loop.quit)
@@ -137,29 +162,35 @@ class NamepaceBrowserWidget(RichJupyterWidget):
         return self._kernel_reply
 
     # ---- Private API (defined by us) ------------------------------
-    def _handle_data_message(self, msg):
+    def _handle_spyder_msg(self, msg):
         """
-        Handle raw (serialized) data sent by the kernel
-
-        We only handle data asked by Spyder, in case people use
-        publish_data for other purposes.
+        Handle internal spyder messages
         """
-        # Deserialize data
-        try:
-            data = deserialize_object(msg['buffers'])[0]
-        except Exception as msg:
-            self._kernel_value = None
-            self._kernel_reply = repr(msg)
+        spyder_msg_type = msg['content'].get('spyder_msg_type')
+        if spyder_msg_type == 'data':
+            # Deserialize data
+            try:
+                if PY2:
+                    value = cloudpickle.loads(msg['buffers'][0])
+                else:
+                    value = cloudpickle.loads(bytes(msg['buffers'][0]))
+            except Exception as msg:
+                self._kernel_value = None
+                self._kernel_reply = repr(msg)
+            else:
+                self._kernel_value = value
             self.sig_got_reply.emit()
             return
-
-        # We only handle data asked by Spyder
-        value = data.get('__spy_data__', None)
-        if value is not None:
-            if isinstance(value, CannedObject):
-                value = value.get_object()
-            self._kernel_value = value
-            self.sig_got_reply.emit()
+        elif spyder_msg_type == 'pdb_state':
+            pdb_state = msg['content']['pdb_state']
+            if pdb_state is not None and isinstance(pdb_state, dict):
+                self.refresh_from_pdb(pdb_state)
+        elif spyder_msg_type == 'pdb_continue':
+            # Run Pdb continue to get to the first breakpoint
+            # Fixes 2034
+            self.write_to_stdin('continue')
+        else:
+            debug_print("No such spyder message type: %s" % spyder_msg_type)
 
     # ---- Private API (overrode by us) ----------------------------
     def _handle_execute_reply(self, msg):
@@ -180,6 +211,7 @@ class NamepaceBrowserWidget(RichJupyterWidget):
                 self.set_namespace_view_settings()
                 self.refresh_namespacebrowser()
             self._kernel_is_starting = False
+            self.ipyclient.t0 = time()
 
         # Handle silent execution of kernel methods
         if info and info.kind == 'silent_exec_method' and not self._hidden:
@@ -195,14 +227,22 @@ class NamepaceBrowserWidget(RichJupyterWidget):
         """
         state = msg['content'].get('execution_state', '')
         msg_type = msg['parent_header'].get('msg_type', '')
-        if state == 'starting' and not self._kernel_is_starting:
+        if state == 'starting':
+            # This is needed to show the time a kernel
+            # has been alive in each console.
+            self.ipyclient.t0 = time()
+            self.ipyclient.timer.timeout.connect(self.ipyclient.show_time)
+            self.ipyclient.timer.start(1000)
+
             # This handles restarts when the kernel dies
             # unexpectedly
-            self._kernel_is_starting = True
+            if not self._kernel_is_starting:
+                self._kernel_is_starting = True
         elif state == 'idle' and msg_type == 'shutdown_request':
             # This handles restarts asked by the user
             if self.namespacebrowser is not None:
                 self.set_namespace_view_settings()
                 self.refresh_namespacebrowser()
+            self.ipyclient.t0 = time()
         else:
             super(NamepaceBrowserWidget, self)._handle_status(msg)

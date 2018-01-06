@@ -18,16 +18,18 @@ import os
 # Third party imports
 from qtpy.QtCore import Qt, Signal
 from qtpy.QtGui import QCursor
-from qtpy.QtWidgets import QApplication, QMainWindow
+from qtpy.QtWidgets import QApplication, QMenu, QMessageBox, QToolButton
 
 # Local imports
 from spyder.config.gui import get_color_scheme
 from spyder.config.main import CONF
 from spyder.config.user import NoDefault
-from spyder.plugins.base import BasePluginWidget
+from spyder.plugins.base import _, BasePluginWidget
 from spyder.py3compat import configparser, is_text_string
 from spyder.utils import icon_manager as ima
-from spyder.utils.qthelpers import toggle_actions
+from spyder.utils.qthelpers import (add_actions, create_toolbutton,
+                                    MENU_SEPARATOR, toggle_actions)
+from spyder.plugins.base import PluginMainWindow
 
 
 class PluginWidget(BasePluginWidget):
@@ -53,6 +55,11 @@ class PluginWidget(BasePluginWidget):
         BasePluginWidget.__init__(self, main)
         assert self.CONF_SECTION is not None
 
+        # Check compatibility
+        check_compatibility, message = self.check_compatibility()
+        if not check_compatibility:
+            self.show_compatibility_message(message)
+
         self.PLUGIN_PATH = os.path.dirname(inspect.getfile(self.__class__))
         self.main = main
         self.default_margins = None
@@ -61,6 +68,10 @@ class PluginWidget(BasePluginWidget):
         self.mainwindow = None
         self.ismaximized = False
         self.isvisible = False
+        self.options_button = create_toolbutton(self, text=_('Options'),
+                                                icon=ima.icon('tooloptions'))
+        self.options_button.setPopupMode(QToolButton.InstantPopup)
+        self.options_menu = QMenu(self)
 
         # NOTE: Don't use the default option of CONF.get to assign a
         # None shortcut to plugins that don't have one. That will mess
@@ -83,7 +94,12 @@ class PluginWidget(BasePluginWidget):
         It must be run at the end of __init__
         """
         self.create_toggle_view_action()
-        self.plugin_actions = self.get_plugin_actions()
+        self.create_undock_action()
+        self.plugin_actions = self.get_plugin_actions() + [MENU_SEPARATOR,
+                                                           self.undock_action]
+        add_actions(self.options_menu, self.plugin_actions)
+        self.options_button.setMenu(self.options_menu)
+        self.options_menu.aboutToShow.connect(self.refresh_actions)
         self.sig_show_message.connect(self.show_message)
         self.sig_update_plugin_title.connect(self.update_plugin_title)
         self.sig_option_changed.connect(self.set_option)
@@ -95,7 +111,7 @@ class PluginWidget(BasePluginWidget):
 
         Note: this method is currently not used in Spyder core plugins
         """
-        self.mainwindow = mainwindow = QMainWindow()
+        self.mainwindow = mainwindow = PluginMainWindow(self)
         mainwindow.setAttribute(Qt.WA_DeleteOnClose)
         icon = self.get_plugin_icon()
         if is_text_string(icon):
@@ -172,6 +188,23 @@ class PluginWidget(BasePluginWidget):
     def get_color_scheme(self):
         """Get current color scheme."""
         return get_color_scheme(CONF.get('color_schemes', 'selected'))
+
+    def show_compatibility_message(self, message):
+        """Show compatibility message."""
+        messageBox = QMessageBox(self)
+        messageBox.setWindowModality(Qt.NonModal)
+        messageBox.setAttribute(Qt.WA_DeleteOnClose)
+        messageBox.setWindowTitle('Compatibility Check')
+        messageBox.setText(message)
+        messageBox.setStandardButtons(QMessageBox.Ok)
+        messageBox.show()
+
+    def refresh_actions(self):
+        """Clear the menu of the plugin and add the actions."""
+        self.options_menu.clear()
+        self.plugin_actions = self.get_plugin_actions() + [MENU_SEPARATOR,
+                                                           self.undock_action]
+        add_actions(self.options_menu, self.plugin_actions)
 
 
 class SpyderPluginWidget(PluginWidget):
@@ -284,3 +317,15 @@ class SpyderPluginWidget(PluginWidget):
         This must be reimplemented by plugins that need to adjust their fonts.
         """
         pass
+
+    def check_compatibility(self):
+        """
+        This method can be implemented to check compatibility of a plugin
+        for a given condition.
+
+        `message` should give information in case of non compatibility:
+        For example: 'This plugin does not work with Qt4'
+        """
+        message = ''
+        valid = True
+        return valid, message

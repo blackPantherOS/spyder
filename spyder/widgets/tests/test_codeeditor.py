@@ -21,8 +21,9 @@ from spyder.widgets.editor import codeeditor
 def editorbot(qtbot):
     widget = codeeditor.CodeEditor(None)
     widget.setup_editor(linenumbers=True, markers=True, tab_mode=False,
-                         font=QFont("Courier New", 10),
-                         show_blanks=True, color_scheme='Zenburn')
+                        font=QFont("Courier New", 10),
+                        show_blanks=True, color_scheme='Zenburn',
+                        scroll_past_end=True)
     widget.setup_editor(language='Python')
     qtbot.addWidget(widget)
     widget.show()
@@ -55,3 +56,37 @@ def test_editor_lower_to_upper(editorbot):
     widget.transform_to_uppercase()
     new_text = widget.get_text('sof', 'eof')
     assert text != new_text
+
+def test_editor_complete_backet(editorbot):
+    qtbot, editor = editorbot
+    editor.textCursor().insertText('foo')
+    qtbot.keyClicks(editor, '(')
+    assert editor.toPlainText() == 'foo()'
+    assert editor.textCursor().columnNumber() == 4
+
+def test_editor_complete_bracket_nested(editorbot):
+    qtbot, editor = editorbot
+    editor.textCursor().insertText('foo(bar)')
+    editor.move_cursor(-1)
+    qtbot.keyClicks(editor, '(')
+    assert editor.toPlainText() == 'foo(bar())'
+    assert editor.textCursor().columnNumber() == 8
+
+def test_editor_bracket_closing(editorbot):
+    qtbot, editor = editorbot
+    editor.textCursor().insertText('foo(bar(x')
+    qtbot.keyClicks(editor, ')')
+    assert editor.toPlainText() == 'foo(bar(x)'
+    assert editor.textCursor().columnNumber() == 10
+    qtbot.keyClicks(editor, ')')
+    assert editor.toPlainText() == 'foo(bar(x))'
+    assert editor.textCursor().columnNumber() == 11
+    # same ')' closing with existing brackets starting at 'foo(bar(x|))'
+    editor.move_cursor(-2)
+    qtbot.keyClicks(editor, ')')
+    assert editor.toPlainText() == 'foo(bar(x))'
+    assert editor.textCursor().columnNumber() == 10
+    qtbot.keyClicks(editor, ')')
+    assert editor.toPlainText() == 'foo(bar(x))'
+    assert editor.textCursor().columnNumber() == 11
+
