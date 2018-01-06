@@ -226,12 +226,10 @@ DEFAULT_LANGUAGE = 'en'
 LANGUAGE_CODES = {'en': u'English',
                   'fr': u'Français',
                   'es': u'Español',
-                  'hu': u'Hungarian',
+                  'hu': u'Magyar',
                   'pt_BR': u'Português',
                   'ru': u'Русский',
-                  'zh_CN': u'简体中文',
-                  'ja': u'日本語',
-                  'de': u'Deutsch'
+                  'ja': u'日本語'
                   }
 
 # Disabled languages (because their translations are outdated)
@@ -270,10 +268,10 @@ def get_interface_language():
     otherwise it will return DEFAULT_LANGUAGE.
 
     Example:
-    1.) Spyder provides ('en',  'fr', 'es' 'hu' and 'pt_BR'), if the locale is
+    1.) Spyder provides ('en',  'fr', 'es', 'hu' and 'pt_BR'), if the locale is
     either 'en_US' or 'en' or 'en_UK', this function will return 'en'
 
-    2.) Spyder provides ('en',  'fr', 'es' 'hu' and 'pt_BR'), if the locale is
+    2.) Spyder provides ('en',  'fr', 'es', 'hu' and 'pt_BR'), if the locale is
     either 'pt' or 'pt_BR', this function will return 'pt_BR'
     """
 
@@ -381,16 +379,16 @@ def get_supported_types():
     If you update this list, don't forget to update doc/variablexplorer.rst
     """
     from datetime import date, timedelta
-    editable_types = [int, float, complex, list, set, dict, tuple, date,
-                      timedelta] + list(TEXT_TYPES) + list(INT_TYPES)
+    editable_types = [int, float, complex, list, dict, tuple, date, timedelta
+                      ] + list(TEXT_TYPES) + list(INT_TYPES)
     try:
         from numpy import ndarray, matrix, generic
         editable_types += [ndarray, matrix, generic]
     except:
         pass
     try:
-        from pandas import DataFrame, Series, Index
-        editable_types += [DataFrame, Series, Index]
+        from pandas import DataFrame, Series, DatetimeIndex
+        editable_types += [DataFrame, Series, DatetimeIndex]
     except:
         pass
     picklable_types = editable_types[:]
